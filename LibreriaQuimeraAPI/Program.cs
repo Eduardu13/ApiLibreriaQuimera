@@ -73,7 +73,7 @@ app.MapPost("/api/registro", (UsuarioRegistro request) =>
             cmd.Parameters.AddWithValue("@Nombre", request.Nombre);
             cmd.Parameters.AddWithValue("@Apellido", request.Apellido);
             cmd.Parameters.AddWithValue("@Correo", request.Correo);
-            cmd.Parameters.AddWithValue("@Contrasena", request.Contrasena); // Idealmente debería estar hasheada
+            cmd.Parameters.AddWithValue("@Contrasena", request.Contrasena);
             cmd.Parameters.AddWithValue("@Telefono", request.Telefono ?? (object)DBNull.Value);
 
             try
@@ -177,7 +177,6 @@ app.MapPost("/api/checkout", (CheckoutRequest request) =>
     }
 });
 
-
 // --- RUTA: Enviar Mensaje de Contacto ---
 app.MapPost("/enviar-contacto", (ContactoRequest request) =>
 {
@@ -205,8 +204,6 @@ app.MapPost("/enviar-contacto", (ContactoRequest request) =>
     }
 });
 
-
-
 app.MapPost("/api/cambiar-password", async (CambioPasswordRequest request) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
@@ -229,6 +226,229 @@ app.MapPost("/api/cambiar-password", async (CambioPasswordRequest request) =>
             {
                 return Results.BadRequest(new { mensaje = "No se encontró el usuario." });
             }
+        }
+    }
+});
+
+string normalizarTexto(string texto)
+{
+    if (string.IsNullOrWhiteSpace(texto)) return "";
+
+    string limpio = texto.Trim().ToLower();
+    return limpio
+        .Replace("á", "a")
+        .Replace("é", "e")
+        .Replace("í", "i")
+        .Replace("ó", "o")
+        .Replace("ú", "u");
+}
+
+string estimarLlegada(string ciudad)
+{
+    string t = normalizarTexto(ciudad);
+
+    // 1. Local / Estado base (1 a 2 días hábiles)
+    string[] zonaLocal = { "campeche", "ciudad del carmen" };
+    if (zonaLocal.Any(x => t.Contains(x)))
+        return "1 a 2 días hábiles";
+
+    // 2. Sureste y península (2 a 4 días hábiles)
+    string[] zonaSureste = {
+        "yucatan", "merida", "valladolid", "tizimin",
+        "quintana roo", "cancun", "playa del carmen", "chetumal", "tulum",
+        "tabasco", "villahermosa", "cardenas",
+        "chiapas", "tuxtla", "san cristobal", "tapachula",
+        "oaxaca", "huatepec", "salina cruz",
+        "veracruz", "xalapa", "coatza", "coatzacoalcos", "poza rica"
+    };
+    if (zonaSureste.Any(x => t.Contains(x)))
+        return "2 a 4 días hábiles";
+
+    // 3. Centro, Bajío y Occidente (3 a 5 días hábiles)
+    string[] zonaCentro = {
+        "ciudad de mexico", "cdmx", "df", "distrito federal",
+        "estado de mexico", "edomex", "toluca", "ecatepec", "nezahualcoyotl", "naucalpan",
+        "puebla", "tehuacan",
+        "morelos", "cuernavaca",
+        "tlaxcala",
+        "hidalgo", "pachuca",
+        "queretaro",
+        "guanajuato", "leon", "irapuato", "celaya",
+        "michoacan", "morelia", "uruapan",
+        "jalisco", "guadalajara", "zapopan", "puerto vallarta",
+        "colima", "manzanillo",
+        "nayarit", "tepic",
+        "guerrero", "acapulco", "chilpancingo",
+        "san luis potosi",
+        "aguascalientes",
+        "zacatecas"
+    };
+    if (zonaCentro.Any(x => t.Contains(x)))
+        return "3 a 5 días hábiles";
+
+    // 4. Norte y Noroeste (4 a 6 días hábiles)
+    string[] zonaNorte = {
+        "nuevo leon", "monterrey", "san nicolas", "guadalupe", "apodaca",
+        "coahuila", "saltillo", "torreon",
+        "tamaulipas", "tampico", "reynosa", "matamoros", "ciudad victoria",
+        "chihuahua", "juarez",
+        "durango", "gomez palacio",
+        "sinaloa", "culiacan", "mazatlan",
+        "sonora", "hermosillo", "obregon", "nogales",
+        "baja california sur", "la paz", "los cabos", "cabo san lucas",
+        "baja california", "tijuana", "mexicali", "ensenada"
+    };
+    if (zonaNorte.Any(x => t.Contains(x)))
+        return "4 a 6 días hábiles";
+
+    return "4 a 6 días hábiles";
+}
+
+// --- RUTA: Consultar Compras del Usuario ---
+app.MapGet("/mis-compras/{idUsuario}", (int idUsuario) =>
+{
+    var listaCompras = new List<object>();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select 
+                p.id_pedido,
+                p.total,
+                p.direccion,
+                p.ciudad,
+                isnull(p.estado, 'Pendiente') as estado,
+                stuff((
+                    select ' | ' + l.titulo + ' (x' + cast(d.cantidad as varchar(10)) + ')'
+                    from Detalles_Pedido d
+                    inner join Libros l on d.id_libro = l.id_libro
+                    where d.id_pedido = p.id_pedido
+                    for xml path(''), type
+                ).value('.', 'nvarchar(max)'), 1, 3, '') as libros
+            from Pedidos p
+            where p.id_usuario = @IdUsuario
+            order by p.id_pedido desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@IdUsuario", idUsuario);
+            using (SqlDataReader reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string estadoActual = reader["estado"]?.ToString() ?? "Pendiente";
+                    string direccionPedido = reader["direccion"] == DBNull.Value ? "Sin dirección" : reader["direccion"].ToString()!;
+                    string ciudadPedido = reader["ciudad"] == DBNull.Value ? "Sin ciudad" : reader["ciudad"].ToString()!;
+                    string librosTexto = reader["libros"] == DBNull.Value ? "Sin detalle" : reader["libros"].ToString()!;
+
+                    listaCompras.Add(new
+                    {
+                        idPedido = reader["id_pedido"],
+                        total = reader["total"],
+                        direccion = direccionPedido,
+                        ciudad = ciudadPedido,
+                        estado = estadoActual,
+                        libros = librosTexto,
+                        estimadoLlegada = estadoActual == "Cancelado" ? "Pedido cancelado" : estimarLlegada(ciudadPedido)
+                    });
+                }
+            }
+        }
+    }
+
+    return Results.Ok(listaCompras);
+});
+
+app.MapGet("/mis-compras-correo/{correo}", (string correo) =>
+{
+    var listaCompras = new List<object>();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select 
+                p.id_pedido,
+                p.total,
+                p.ciudad,
+                isnull(p.estado, 'Pendiente') as estado,
+                stuff((
+                    select ', ' + l.titulo + ' (x' + cast(d.cantidad as varchar(10)) + ')'
+                    from Detalles_Pedido d
+                    inner join Libros l on d.id_libro = l.id_libro
+                    where d.id_pedido = p.id_pedido
+                    for xml path(''), type
+                ).value('.', 'nvarchar(max)'), 1, 2, '') as libros
+            from Pedidos p
+            inner join Usuarios u on p.id_usuario = u.id_usuario
+            where u.correo = @Correo
+            order by p.id_pedido desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Correo", correo);
+            using (SqlDataReader reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    string estadoActual = reader["estado"]?.ToString() ?? "Pendiente";
+                    string ciudadPedido = reader["ciudad"]?.ToString() ?? "";
+                    string librosTexto = reader["libros"] == DBNull.Value ? "Sin detalle" : reader["libros"].ToString()!;
+
+                    listaCompras.Add(new
+                    {
+                        idPedido = reader["id_pedido"],
+                        total = reader["total"],
+                        estado = estadoActual,
+                        libros = librosTexto,
+                        estimadoLlegada = estadoActual == "Cancelado" ? "Pedido cancelado" : estimarLlegada(ciudadPedido)
+                    });
+                }
+            }
+        }
+    }
+
+    return Results.Ok(listaCompras);
+});
+
+// --- RUTA: Cancelar Compra y Devolver Stock ---
+app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        SqlTransaction transaccion = conn.BeginTransaction();
+
+        try
+        {
+            string queryStock = @"
+                update Libros
+                set stock = stock + d.cantidad
+                from Libros l
+                inner join Detalles_Pedido d on l.id_libro = d.id_libro
+                where d.id_pedido = @IdPedido";
+
+            using (SqlCommand cmdStock = new SqlCommand(queryStock, conn, transaccion))
+            {
+                cmdStock.Parameters.AddWithValue("@IdPedido", idPedido);
+                cmdStock.ExecuteNonQuery();
+            }
+
+            string queryEstado = "update Pedidos set estado = 'Cancelado' where id_pedido = @IdPedido";
+            using (SqlCommand cmdEstado = new SqlCommand(queryEstado, conn, transaccion))
+            {
+                cmdEstado.Parameters.AddWithValue("@IdPedido", idPedido);
+                cmdEstado.ExecuteNonQuery();
+            }
+
+            transaccion.Commit();
+            return Results.Ok(new { exito = true, mensaje = "Compra cancelada y stock devuelto." });
+        }
+        catch (Exception ex)
+        {
+            transaccion.Rollback();
+            return Results.Ok(new { exito = false, mensaje = "Error al cancelar compra: " + ex.Message });
         }
     }
 });

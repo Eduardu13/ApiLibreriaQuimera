@@ -617,7 +617,7 @@ app.MapGet("/api/admin/categorias", () =>
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
         conn.Open();
-        string query = "select id_categoria, nombre from Categorias order by nombre";
+        string query = "select id_categoria, nombre from Categorias order by id_categoria";
         using (SqlCommand cmd = new SqlCommand(query, conn))
         using (SqlDataReader reader = cmd.ExecuteReader())
         {
@@ -763,7 +763,6 @@ app.MapPut("/api/admin/pedidos/{idPedido}/estado", (int idPedido, EstadoPedidoDt
 
 
 // --- ADMIN: Eliminar libro del catálogo ---
-// --- ADMIN: Eliminar libro del catálogo ---
 app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro) =>
 {
     if (string.IsNullOrWhiteSpace(idLibro))
@@ -868,6 +867,42 @@ app.MapDelete("/api/admin/categorias/{id:int}", (int id) =>
     return Results.Ok(new { mensaje = "Categoría eliminada correctamente." });
 });
 
+
+
+
+// --- ADMIN: Editar libro (precio, stock, etc.) ---
+app.MapPut("/api/admin/libros/{id}", (string id, EditarLibroDto req) =>
+{
+    if (req.Precio < 0 || req.Stock < 0)
+        return Results.BadRequest(new { mensaje = "El precio y el stock no pueden ser negativos." });
+
+    string idLimpio = Uri.UnescapeDataString(id).Trim();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        string queryUpdate = @"
+            update Libros
+            set precio = @Precio,
+                stock = @Stock
+            where id_libro = @Id";
+
+        using (SqlCommand cmd = new SqlCommand(queryUpdate, conn))
+        {
+            cmd.Parameters.AddWithValue("@Id", idLimpio);
+            cmd.Parameters.AddWithValue("@Precio", req.Precio);
+            cmd.Parameters.AddWithValue("@Stock", req.Stock);
+
+            int filas = cmd.ExecuteNonQuery();
+            if (filas == 0)
+                return Results.NotFound(new { mensaje = "Libro no encontrado." });
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Libro actualizado correctamente." });
+});
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 
@@ -887,6 +922,8 @@ record NuevoLibroAdminDto(string Titulo, string Autor, decimal Precio, int Stock
 record EstadoPedidoDto(string Estado);
 
 record NuevaCategoriaDto(string Nombre);
+
+record EditarLibroDto(decimal Precio, int Stock);
 
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---

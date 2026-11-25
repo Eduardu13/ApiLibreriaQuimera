@@ -515,8 +515,109 @@ app.MapDelete("/eliminar-comentario/{idMensaje}", (int idMensaje) =>
 });
 
 
+
+
+
+// --- RUTA: Obtener datos del perfil por ID ---
+app.MapGet("/api/perfil/{idUsuario}", (int idUsuario) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select id_usuario, nombre, apellido, correo, telefono, direccion, ciudad, codigo_postal
+            from Usuarios
+            where id_usuario = @IdUsuario";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@IdUsuario", idUsuario);
+            using (SqlDataReader reader = cmd.ExecuteReader())
+            {
+                if (!reader.Read())
+                    return Results.NotFound(new { mensaje = "Usuario no encontrado." });
+
+                return Results.Ok(new
+                {
+                    id = reader["id_usuario"],
+                    nombre = reader["nombre"]?.ToString() ?? "",
+                    apellido = reader["apellido"]?.ToString() ?? "",
+                    correo = reader["correo"]?.ToString() ?? "",
+                    telefono = reader["telefono"]?.ToString() ?? "",
+                    direccion = reader["direccion"]?.ToString() ?? "",
+                    ciudad = reader["ciudad"]?.ToString() ?? "",
+                    codigo_postal = reader["codigo_postal"]?.ToString() ?? ""
+                });
+            }
+        }
+    }
+});
+
+// --- RUTA: Actualizar perfil (correo NO editable) ---
+app.MapPut("/api/perfil/{idUsuario}", (int idUsuario, PerfilUpdateDto datos) =>
+{
+    if (string.IsNullOrWhiteSpace(datos.Nombre))
+        return Results.BadRequest(new { mensaje = "El nombre es obligatorio." });
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        string query = string.IsNullOrWhiteSpace(datos.Contrasena)
+            ? @"update Usuarios
+                set nombre = @Nombre,
+                    apellido = @Apellido,
+                    telefono = @Telefono,
+                    direccion = @Direccion,
+                    ciudad = @Ciudad,
+                    codigo_postal = @CodigoPostal
+                where id_usuario = @IdUsuario"
+            : @"update Usuarios
+                set nombre = @Nombre,
+                    apellido = @Apellido,
+                    contrasena = @Contrasena,
+                    telefono = @Telefono,
+                    direccion = @Direccion,
+                    ciudad = @Ciudad,
+                    codigo_postal = @CodigoPostal
+                where id_usuario = @IdUsuario";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@IdUsuario", idUsuario);
+            cmd.Parameters.AddWithValue("@Nombre", datos.Nombre.Trim());
+            cmd.Parameters.AddWithValue("@Apellido", (datos.Apellido ?? "").Trim());
+            cmd.Parameters.AddWithValue("@Telefono", (datos.Telefono ?? "").Trim());
+            cmd.Parameters.AddWithValue("@Direccion", (datos.Direccion ?? "").Trim());
+            cmd.Parameters.AddWithValue("@Ciudad", (datos.Ciudad ?? "").Trim());
+            cmd.Parameters.AddWithValue("@CodigoPostal", (datos.CodigoPostal ?? "").Trim());
+
+            if (!string.IsNullOrWhiteSpace(datos.Contrasena))
+                cmd.Parameters.AddWithValue("@Contrasena", datos.Contrasena);
+
+            int filas = cmd.ExecuteNonQuery();
+            if (filas == 0)
+                return Results.NotFound(new { mensaje = "No se pudo actualizar el perfil." });
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Perfil actualizado correctamente." });
+});
+
+
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
+
+record PerfilUpdateDto(
+    string Nombre,
+    string? Apellido,
+    string? Contrasena,
+    string? Telefono,
+    string? Direccion,
+    string? Ciudad,
+    string? CodigoPostal
+);
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---
 public record CambioPasswordRequest(string Correo, string NuevaPassword);

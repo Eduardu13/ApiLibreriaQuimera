@@ -453,6 +453,68 @@ app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
     }
 });
 
+
+// --- RUTA: Ver Comentarios Enviados por Correo ---
+app.MapGet("/mis-comentarios/{correo}", (string correo) =>
+{
+    var listaComentarios = new List<object>();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select id_mensaje, nombre, telefono, correo, mensaje, fecha_envio
+            from Mensajes_Contacto
+            where correo = @Correo
+            order by fecha_envio desc, id_mensaje desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Correo", correo);
+            using (SqlDataReader reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    listaComentarios.Add(new
+                    {
+                        idMensaje = reader["id_mensaje"],
+                        nombre = reader["nombre"]?.ToString() ?? "",
+                        telefono = reader["telefono"]?.ToString() ?? "",
+                        correo = reader["correo"]?.ToString() ?? "",
+                        mensaje = reader["mensaje"]?.ToString() ?? "",
+                        fechaEnvio = reader["fecha_envio"]?.ToString() ?? ""
+                    });
+                }
+            }
+        }
+    }
+
+    return Results.Ok(listaComentarios);
+});
+
+// --- RUTA: Eliminar Comentario de Contacto ---
+app.MapDelete("/eliminar-comentario/{idMensaje}", (int idMensaje) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = "delete from Mensajes_Contacto where id_mensaje = @IdMensaje";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@IdMensaje", idMensaje);
+            int filas = cmd.ExecuteNonQuery();
+
+            if (filas > 0)
+            {
+                return Results.Ok(new { exito = true, mensaje = "Comentario eliminado." });
+            }
+            return Results.NotFound(new { exito = false, mensaje = "No se encontró el comentario." });
+        }
+    }
+});
+
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 

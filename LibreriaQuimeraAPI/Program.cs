@@ -606,6 +606,268 @@ app.MapPut("/api/perfil/{idUsuario}", (int idUsuario, PerfilUpdateDto datos) =>
 
 
 
+
+
+
+
+// --- ADMIN: Obtener categorías para formulario de libros ---
+app.MapGet("/api/admin/categorias", () =>
+{
+    var categorias = new List<object>();
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = "select id_categoria, nombre from Categorias order by nombre";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                categorias.Add(new
+                {
+                    idCategoria = Convert.ToInt32(reader["id_categoria"]),
+                    nombre = reader["nombre"].ToString() ?? ""
+                });
+            }
+        }
+    }
+    return Results.Ok(categorias);
+});
+
+// --- ADMIN: Agregar nuevo libro ---
+// --- ADMIN: Agregar nuevo libro ---
+app.MapPost("/api/admin/libros", (NuevoLibroAdminDto libro) =>
+{
+    if (string.IsNullOrWhiteSpace(libro.Titulo) || string.IsNullOrWhiteSpace(libro.Autor))
+        return Results.BadRequest(new { mensaje = "Título y autor son obligatorios." });
+
+    int idCategoria = libro.IdCategoria > 0 ? libro.IdCategoria : 1;
+    string imagen = string.IsNullOrWhiteSpace(libro.Imagen) ? "./img/default-book.jpg" : libro.Imagen.Trim();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        // Buscamos el número más alto dentro de los id_libro existentes (ej. 'libroRomance-20' -> 20)
+        int maxNum = 0;
+        string queryIds = "select id_libro from Libros";
+        using (SqlCommand cmdIds = new SqlCommand(queryIds, conn))
+        using (SqlDataReader readerIds = cmdIds.ExecuteReader())
+        {
+            while (readerIds.Read())
+            {
+                string idTexto = readerIds["id_libro"]?.ToString() ?? "";
+                string soloDigitos = new string(idTexto.Where(char.IsDigit).ToArray());
+                if (int.TryParse(soloDigitos, out int num) && num > maxNum)
+                {
+                    maxNum = num;
+                }
+            }
+        }
+
+        string nuevoIdLibro = $"libro-{maxNum + 1}";
+
+        string query = @"
+            insert into Libros (id_libro, titulo, autor, precio, stock, imagen, id_categoria)
+            values (@IdLibro, @Titulo, @Autor, @Precio, @Stock, @Imagen, @IdCategoria)";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@IdLibro", nuevoIdLibro);
+            cmd.Parameters.AddWithValue("@Titulo", libro.Titulo.Trim());
+            cmd.Parameters.AddWithValue("@Autor", libro.Autor.Trim());
+            cmd.Parameters.AddWithValue("@Precio", libro.Precio);
+            cmd.Parameters.AddWithValue("@Stock", libro.Stock);
+            cmd.Parameters.AddWithValue("@Imagen", imagen);
+            cmd.Parameters.AddWithValue("@IdCategoria", idCategoria);
+
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Libro agregado correctamente al catálogo." });
+});
+
+// --- ADMIN: Listar todos los pedidos ---
+app.MapGet("/api/admin/pedidos", () =>
+{
+    var pedidos = new List<object>();
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select
+                p.id_pedido,
+                p.total,
+                p.direccion,
+                p.ciudad,
+                isnull(p.estado, 'Pendiente') as estado,
+                u.nombre + ' ' + u.apellido as cliente,
+                u.correo,
+                stuff((
+                    select ' | ' + l.titulo + ' (x' + cast(d.cantidad as varchar(10)) + ')'
+                    from Detalles_Pedido d
+                    inner join Libros l on d.id_libro = l.id_libro
+                    where d.id_pedido = p.id_pedido
+                    for xml path(''), type
+                ).value('.', 'nvarchar(max)'), 1, 3, '') as libros
+            from Pedidos p
+            left join Usuarios u on p.id_usuario = u.id_usuario
+            order by p.id_pedido desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                pedidos.Add(new
+                {
+                    idPedido = Convert.ToInt32(reader["id_pedido"]),
+                    total = Convert.ToDecimal(reader["total"]),
+                    direccion = reader["direccion"] == DBNull.Value ? "" : reader["direccion"].ToString(),
+                    ciudad = reader["ciudad"] == DBNull.Value ? "" : reader["ciudad"].ToString(),
+                    estado = reader["estado"]?.ToString() ?? "Pendiente",
+                    cliente = reader["cliente"] == DBNull.Value ? "Cliente" : reader["cliente"].ToString(),
+                    correo = reader["correo"] == DBNull.Value ? "" : reader["correo"].ToString(),
+                    libros = reader["libros"] == DBNull.Value ? "Sin detalle" : reader["libros"].ToString()
+                });
+            }
+        }
+    }
+    return Results.Ok(pedidos);
+});
+
+// --- ADMIN: Actualizar estado de un pedido ---
+app.MapPut("/api/admin/pedidos/{idPedido}/estado", (int idPedido, EstadoPedidoDto req) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Estado))
+        return Results.BadRequest(new { mensaje = "El estado es obligatorio." });
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = "update Pedidos set estado = @Estado where id_pedido = @IdPedido";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Estado", req.Estado.Trim());
+            cmd.Parameters.AddWithValue("@IdPedido", idPedido);
+            int filas = cmd.ExecuteNonQuery();
+            if (filas == 0)
+                return Results.NotFound(new { mensaje = "Pedido no encontrado." });
+        }
+    }
+    return Results.Ok(new { mensaje = "Estado actualizado correctamente." });
+});
+
+
+
+
+// --- ADMIN: Eliminar libro del catálogo ---
+// --- ADMIN: Eliminar libro del catálogo ---
+app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro) =>
+{
+    if (string.IsNullOrWhiteSpace(idLibro))
+        return Results.BadRequest(new { mensaje = "ID de libro no válido." });
+
+    string idLimpio = Uri.UnescapeDataString(idLibro).Trim();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = "delete from Libros where rtrim(ltrim(id_libro)) = @IdLibro";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@IdLibro", idLimpio);
+
+            try
+            {
+                int filas = cmd.ExecuteNonQuery();
+                if (filas == 0)
+                    return Results.NotFound(new { mensaje = $"No se encontró el libro con ID '{idLimpio}'." });
+
+                return Results.Ok(new { mensaje = "Libro eliminado correctamente." });
+            }
+            catch (SqlException)
+            {
+                return Results.BadRequest(new { mensaje = "No se puede eliminar porque el libro ya está en un pedido." });
+            }
+        }
+    }
+});
+
+
+app.MapGet("/api/admin/ping", () => Results.Ok(new { ok = true, mensaje = "API actualizada" }));
+
+
+
+
+
+// --- ADMIN: Crear nueva categoría ---
+app.MapPost("/api/admin/categorias", (NuevaCategoriaDto req) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Nombre))
+        return Results.BadRequest(new { mensaje = "El nombre de la categoría es obligatorio." });
+
+    string nombreLimpio = req.Nombre.Trim();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        // Evita duplicados (ignorando mayúsculas/minúsculas)
+        string queryExiste = "select count(*) from Categorias where lower(nombre) = lower(@Nombre)";
+        using (SqlCommand cmdExiste = new SqlCommand(queryExiste, conn))
+        {
+            cmdExiste.Parameters.AddWithValue("@Nombre", nombreLimpio);
+            int existe = (int)cmdExiste.ExecuteScalar();
+            if (existe > 0)
+                return Results.BadRequest(new { mensaje = "Esa categoría ya existe." });
+        }
+
+        string queryInsert = "insert into Categorias (nombre) values (@Nombre)";
+        using (SqlCommand cmdInsert = new SqlCommand(queryInsert, conn))
+        {
+            cmdInsert.Parameters.AddWithValue("@Nombre", nombreLimpio);
+            cmdInsert.ExecuteNonQuery();
+        }
+    }
+
+    return Results.Ok(new { mensaje = $"Categoría '{nombreLimpio}' creada correctamente." });
+});
+
+
+
+
+// --- ADMIN: Eliminar categoría ---
+app.MapDelete("/api/admin/categorias/{id:int}", (int id) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        string queryLibros = "select count(*) from Libros where id_categoria = @Id";
+        using (SqlCommand cmdLibros = new SqlCommand(queryLibros, conn))
+        {
+            cmdLibros.Parameters.AddWithValue("@Id", id);
+            int totalLibros = (int)cmdLibros.ExecuteScalar();
+            if (totalLibros > 0)
+                return Results.BadRequest(new { mensaje = "No puedes eliminar esta categoría porque tiene libros asignados." });
+        }
+
+        string queryDelete = "delete from Categorias where id_categoria = @Id";
+        using (SqlCommand cmdDelete = new SqlCommand(queryDelete, conn))
+        {
+            cmdDelete.Parameters.AddWithValue("@Id", id);
+            int filas = cmdDelete.ExecuteNonQuery();
+            if (filas == 0)
+                return Results.NotFound(new { mensaje = "Categoría no encontrada." });
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Categoría eliminada correctamente." });
+});
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 
@@ -618,6 +880,14 @@ record PerfilUpdateDto(
     string? Ciudad,
     string? CodigoPostal
 );
+
+
+
+record NuevoLibroAdminDto(string Titulo, string Autor, decimal Precio, int Stock, string? Imagen, int IdCategoria);
+record EstadoPedidoDto(string Estado);
+
+record NuevaCategoriaDto(string Nombre);
+
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---
 public record CambioPasswordRequest(string Correo, string NuevaPassword);

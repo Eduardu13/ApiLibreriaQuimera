@@ -454,43 +454,7 @@ app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
 });
 
 
-// --- RUTA: Ver Comentarios Enviados por Correo ---
-app.MapGet("/mis-comentarios/{correo}", (string correo) =>
-{
-    var listaComentarios = new List<object>();
 
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-        string query = @"
-            select id_mensaje, nombre, telefono, correo, mensaje, fecha_envio
-            from Mensajes_Contacto
-            where correo = @Correo
-            order by fecha_envio desc, id_mensaje desc";
-
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        {
-            cmd.Parameters.AddWithValue("@Correo", correo);
-            using (SqlDataReader reader = cmd.ExecuteReader())
-            {
-                while (reader.Read())
-                {
-                    listaComentarios.Add(new
-                    {
-                        idMensaje = reader["id_mensaje"],
-                        nombre = reader["nombre"]?.ToString() ?? "",
-                        telefono = reader["telefono"]?.ToString() ?? "",
-                        correo = reader["correo"]?.ToString() ?? "",
-                        mensaje = reader["mensaje"]?.ToString() ?? "",
-                        fechaEnvio = reader["fecha_envio"]?.ToString() ?? ""
-                    });
-                }
-            }
-        }
-    }
-
-    return Results.Ok(listaComentarios);
-});
 
 // --- RUTA: Eliminar Comentario de Contacto ---
 app.MapDelete("/eliminar-comentario/{idMensaje}", (int idMensaje) =>
@@ -903,6 +867,147 @@ app.MapPut("/api/admin/libros/{id}", (string id, EditarLibroDto req) =>
     return Results.Ok(new { mensaje = "Libro actualizado correctamente." });
 });
 
+
+
+
+
+
+// --- RUTA ACTUALIZADA: Ver Comentarios y Respuestas del Usuario ---
+
+app.MapGet("/mis-comentarios/{correo}", (string correo) =>
+{
+    var listaComentarios = new List<object>();
+
+    try
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            string query = @"
+                select id_mensaje, nombre, telefono, correo, mensaje, fecha_envio,
+                       respuesta_admin, fecha_respuesta, isnull(leido_usuario, 0) as leido_usuario
+                from Mensajes_Contacto
+                where lower(ltrim(rtrim(correo))) = lower(ltrim(rtrim(@Correo)))
+                order by fecha_envio desc, id_mensaje desc";
+
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@Correo", correo);
+                using (SqlDataReader reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        bool leido = false;
+                        if (reader["leido_usuario"] != DBNull.Value)
+                        {
+                            leido = Convert.ToInt32(reader["leido_usuario"]) != 0;
+                        }
+
+                        listaComentarios.Add(new
+                        {
+                            idMensaje = reader["id_mensaje"],
+                            nombre = reader["nombre"]?.ToString() ?? "",
+                            telefono = reader["telefono"]?.ToString() ?? "",
+                            correo = reader["correo"]?.ToString() ?? "",
+                            mensaje = reader["mensaje"]?.ToString() ?? "",
+                            fechaEnvio = reader["fecha_envio"] == DBNull.Value ? "" : Convert.ToDateTime(reader["fecha_envio"]).ToString("dd/MM/yyyy HH:mm"),
+                            respuestaAdmin = reader["respuesta_admin"] == DBNull.Value ? null : reader["respuesta_admin"].ToString(),
+                            fechaRespuesta = reader["fecha_respuesta"] == DBNull.Value ? null : Convert.ToDateTime(reader["fecha_respuesta"]).ToString("dd/MM/yyyy HH:mm"),
+                            leidoUsuario = leido
+                        });
+                    }
+                }
+            }
+        }
+
+        return Results.Ok(listaComentarios);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { mensaje = "Error en /mis-comentarios: " + ex.Message });
+    }
+});
+
+
+// --- RUTA: Marcar respuesta como leída por el usuario ---
+app.MapPut("/api/comentarios/{idMensaje:int}/leido", (int idMensaje) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = "update Mensajes_Contacto set leido_usuario = 1 where id_mensaje = @Id";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Id", idMensaje);
+            cmd.ExecuteNonQuery();
+        }
+    }
+    return Results.Ok(new { mensaje = "Marcado como leído." });
+});
+
+// --- ADMIN: Listar todos los mensajes de contacto ---
+app.MapGet("/api/admin/mensajes", () =>
+{
+    var mensajes = new List<object>();
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select id_mensaje, nombre, telefono, correo, mensaje, fecha_envio, respuesta_admin, fecha_respuesta
+            from Mensajes_Contacto
+            order by fecha_envio desc, id_mensaje desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                mensajes.Add(new
+                {
+                    idMensaje = Convert.ToInt32(reader["id_mensaje"]),
+                    nombre = reader["nombre"] == DBNull.Value ? "Anónimo" : reader["nombre"].ToString(),
+                    telefono = reader["telefono"] == DBNull.Value ? "" : reader["telefono"].ToString(),
+                    correo = reader["correo"] == DBNull.Value ? "" : reader["correo"].ToString(),
+                    mensaje = reader["mensaje"] == DBNull.Value ? "" : reader["mensaje"].ToString(),
+                    fechaEnvio = reader["fecha_envio"] == DBNull.Value ? "" : Convert.ToDateTime(reader["fecha_envio"]).ToString("dd/MM/yyyy HH:mm"),
+                    respuestaAdmin = reader["respuesta_admin"] == DBNull.Value ? null : reader["respuesta_admin"].ToString(),
+                    fechaRespuesta = reader["fecha_respuesta"] == DBNull.Value ? null : Convert.ToDateTime(reader["fecha_respuesta"]).ToString("dd/MM/yyyy HH:mm")
+                });
+            }
+        }
+    }
+    return Results.Ok(mensajes);
+});
+
+// --- ADMIN: Responder a un mensaje ---
+app.MapPut("/api/admin/mensajes/{idMensaje:int}/responder", (int idMensaje, RespuestaMensajeDto req) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Respuesta))
+        return Results.BadRequest(new { mensaje = "La respuesta no puede estar vacía." });
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            update Mensajes_Contacto
+            set respuesta_admin = @Respuesta,
+                fecha_respuesta = GETDATE(),
+                leido_usuario = 0
+            where id_mensaje = @Id";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Respuesta", req.Respuesta.Trim());
+            cmd.Parameters.AddWithValue("@Id", idMensaje);
+            int filas = cmd.ExecuteNonQuery();
+            if (filas == 0)
+                return Results.NotFound(new { mensaje = "Mensaje no encontrado." });
+        }
+    }
+    return Results.Ok(new { mensaje = "Respuesta enviada correctamente." });
+});
+
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 
@@ -925,6 +1030,7 @@ record NuevaCategoriaDto(string Nombre);
 
 record EditarLibroDto(decimal Precio, int Stock);
 
+record RespuestaMensajeDto(string Respuesta);
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---
 public record CambioPasswordRequest(string Correo, string NuevaPassword);

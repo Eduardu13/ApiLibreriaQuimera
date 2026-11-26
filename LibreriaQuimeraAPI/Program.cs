@@ -1008,6 +1008,97 @@ app.MapPut("/api/admin/mensajes/{idMensaje:int}/responder", (int idMensaje, Resp
 });
 
 
+
+
+
+
+
+
+app.MapGet("/api/banner-popup", () =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select top 1 id_banner, imagen_url, enlace_url, activo
+            from Banner_Popup
+            order by id_banner desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            if (reader.Read())
+            {
+                return Results.Ok(new
+                {
+                    idBanner = Convert.ToInt32(reader["id_banner"]),
+                    imagenUrl = reader["imagen_url"] == DBNull.Value ? "" : reader["imagen_url"].ToString(),
+                    enlaceUrl = reader["enlace_url"] == DBNull.Value ? "ofertas.html" : reader["enlace_url"].ToString(),
+                    activo = reader["activo"] != DBNull.Value && Convert.ToBoolean(reader["activo"])
+                });
+            }
+        }
+    }
+
+    return Results.Ok(new
+    {
+        idBanner = 0,
+        imagenUrl = "",
+        enlaceUrl = "ofertas.html",
+        activo = false
+    });
+});
+
+app.MapPut("/api/banner-popup", (GuardarBannerDto req) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        string checkQuery = "select count(*) from Banner_Popup";
+        int total;
+        using (SqlCommand checkCmd = new SqlCommand(checkQuery, conn))
+        {
+            total = Convert.ToInt32(checkCmd.ExecuteScalar());
+        }
+
+        if (total == 0)
+        {
+            string insertQuery = @"
+                insert into Banner_Popup (imagen_url, enlace_url, activo, fecha_actualizacion)
+                values (@ImagenUrl, @EnlaceUrl, @Activo, getdate())";
+
+            using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
+            {
+                cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@EnlaceUrl", string.IsNullOrWhiteSpace(req.EnlaceUrl) ? "ofertas.html" : req.EnlaceUrl.Trim());
+                cmd.Parameters.AddWithValue("@Activo", req.Activo);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        else
+        {
+            string updateQuery = @"
+                update Banner_Popup
+                set imagen_url = @ImagenUrl,
+                    enlace_url = @EnlaceUrl,
+                    activo = @Activo,
+                    fecha_actualizacion = getdate()";
+
+            using (SqlCommand cmd = new SqlCommand(updateQuery, conn))
+            {
+                cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@EnlaceUrl", string.IsNullOrWhiteSpace(req.EnlaceUrl) ? "ofertas.html" : req.EnlaceUrl.Trim());
+                cmd.Parameters.AddWithValue("@Activo", req.Activo);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Banner actualizado correctamente." });
+});
+
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 
@@ -1031,6 +1122,8 @@ record NuevaCategoriaDto(string Nombre);
 record EditarLibroDto(decimal Precio, int Stock);
 
 record RespuestaMensajeDto(string Respuesta);
+
+record GuardarBannerDto(string? ImagenUrl, string? EnlaceUrl, bool Activo);
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---
 public record CambioPasswordRequest(string Correo, string NuevaPassword);

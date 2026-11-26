@@ -1245,6 +1245,7 @@ app.MapGet("/api/admin/secciones-libros", () =>
 
     return Results.Ok(lista);
 });
+
 app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
 {
     string seccion = (req.Seccion ?? "").Trim().ToLower();
@@ -1253,6 +1254,7 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
     if (seccion != "recomendaciones" &&
         seccion != "novedades" &&
         seccion != "pagina_novedades" &&
+        seccion != "mas_buscados_quincena" &&
         seccion != "mas_vendido" &&
         seccion != "ofertas")
     {
@@ -1350,9 +1352,11 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
         ? "Libro agregado a ofertas."
         : seccion == "pagina_novedades"
             ? "Libro agregado a la página de Novedades."
-            : seccion == "novedades"
-                ? "Libro agregado a novedades."
-                : "Libro agregado a la sección de inicio.";
+            : seccion == "mas_buscados_quincena"
+                ? "Libro agregado a Los Más Buscados de la Quincena."
+                : seccion == "novedades"
+                    ? "Libro agregado a novedades."
+                    : "Libro agregado a la sección de inicio.";
 
     return Results.Ok(new { mensaje });
 });

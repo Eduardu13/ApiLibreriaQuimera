@@ -1099,6 +1099,222 @@ app.MapPut("/api/banner-popup", (GuardarBannerDto req) =>
 });
 
 
+
+
+
+
+
+
+
+app.MapGet("/api/banners-intermedios", () =>
+{
+    var lista = new List<object>();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select clave_banner, imagen_url, enlace_url, activo
+            from Banners_Intermedios";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                lista.Add(new
+                {
+                    claveBanner = reader["clave_banner"].ToString(),
+                    imagenUrl = reader["imagen_url"] == DBNull.Value ? "" : reader["imagen_url"].ToString(),
+                    enlaceUrl = reader["enlace_url"] == DBNull.Value ? "" : reader["enlace_url"].ToString(),
+                    activo = reader["activo"] != DBNull.Value && Convert.ToBoolean(reader["activo"])
+                });
+            }
+        }
+    }
+
+    return Results.Ok(lista);
+});
+
+app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerIntermedioDto req) =>
+{
+    string claveLimpia = (clave ?? "").Trim().ToLower();
+    if (claveLimpia != "contacto" && claveLimpia != "ofertas")
+    {
+        return Results.BadRequest(new { mensaje = "Clave de banner no válida." });
+    }
+
+    string enlaceDefecto = claveLimpia == "contacto" ? "contacto.html" : "ofertas.html";
+    string enlaceFinal = string.IsNullOrWhiteSpace(req.EnlaceUrl) ? enlaceDefecto : req.EnlaceUrl.Trim();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        string checkQuery = "select count(*) from Banners_Intermedios where clave_banner = @Clave";
+        int existe;
+        using (SqlCommand checkCmd = new SqlCommand(checkQuery, conn))
+        {
+            checkCmd.Parameters.AddWithValue("@Clave", claveLimpia);
+            existe = Convert.ToInt32(checkCmd.ExecuteScalar());
+        }
+
+        if (existe == 0)
+        {
+            string insertQuery = @"
+                insert into Banners_Intermedios (clave_banner, imagen_url, enlace_url, activo, fecha_actualizacion)
+                values (@Clave, @ImagenUrl, @EnlaceUrl, @Activo, getdate())";
+
+            using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
+            {
+                cmd.Parameters.AddWithValue("@Clave", claveLimpia);
+                cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@EnlaceUrl", enlaceFinal);
+                cmd.Parameters.AddWithValue("@Activo", req.Activo);
+                cmd.ExecuteNonQuery();
+            }
+        }
+        else
+        {
+            string updateQuery = @"
+                update Banners_Intermedios
+                set imagen_url = @ImagenUrl,
+                    enlace_url = @EnlaceUrl,
+                    activo = @Activo,
+                    fecha_actualizacion = getdate()
+                where clave_banner = @Clave";
+
+            using (SqlCommand cmd = new SqlCommand(updateQuery, conn))
+            {
+                cmd.Parameters.AddWithValue("@Clave", claveLimpia);
+                cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@EnlaceUrl", enlaceFinal);
+                cmd.Parameters.AddWithValue("@Activo", req.Activo);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Banner intermedio actualizado correctamente." });
+});
+
+
+
+
+
+
+
+app.MapGet("/api/admin/secciones-libros", () =>
+{
+    var lista = new List<object>();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select sl.id_seccion_libro, sl.seccion, sl.id_libro, sl.orden,
+                   sl.precio_oferta, sl.descuento,
+                   l.Titulo, l.Autor, l.Precio, l.Imagen
+            from Seccion_Libros sl
+            inner join Libros l on l.id_libro = sl.id_libro
+            order by sl.seccion, sl.orden, sl.id_seccion_libro desc";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                lista.Add(new
+                {
+                    idSeccionLibro = Convert.ToInt32(reader["id_seccion_libro"]),
+                    seccion = reader["seccion"].ToString(),
+                    idLibro = reader["id_libro"].ToString(),
+                    orden = Convert.ToInt32(reader["orden"]),
+                    precioOferta = reader["precio_oferta"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["precio_oferta"]),
+                    descuento = reader["descuento"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["descuento"]),
+                    titulo = reader["Titulo"].ToString(),
+                    autor = reader["Autor"].ToString(),
+                    precio = Convert.ToDecimal(reader["Precio"]),
+                    imagen = reader["Imagen"] == DBNull.Value ? "" : reader["Imagen"].ToString()
+                });
+            }
+        }
+    }
+
+    return Results.Ok(lista);
+});
+
+app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
+{
+    string seccion = (req.Seccion ?? "").Trim().ToLower();
+    string idLibro = (req.IdLibro ?? "").Trim();
+
+    if (seccion != "recomendaciones" && seccion != "novedades" && seccion != "mas_vendido" && seccion != "ofertas")
+    {
+        return Results.BadRequest(new { mensaje = "Sección no válida." });
+    }
+
+    if (string.IsNullOrWhiteSpace(idLibro))
+    {
+        return Results.BadRequest(new { mensaje = "Selecciona un libro." });
+    }
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+
+        string existeQuery = @"
+            select count(*) from Seccion_Libros
+            where seccion = @Seccion and id_libro = @IdLibro";
+
+        using (SqlCommand existeCmd = new SqlCommand(existeQuery, conn))
+        {
+            existeCmd.Parameters.AddWithValue("@Seccion", seccion);
+            existeCmd.Parameters.AddWithValue("@IdLibro", idLibro);
+            int yaEsta = Convert.ToInt32(existeCmd.ExecuteScalar());
+            if (yaEsta > 0)
+            {
+                return Results.BadRequest(new { mensaje = "Ese libro ya está asignado a esta sección." });
+            }
+        }
+
+        string insertQuery = @"
+            insert into Seccion_Libros (seccion, id_libro, orden, fecha_agregado, precio_oferta, descuento)
+            values (@Seccion, @IdLibro, 0, getdate(), @PrecioOferta, @Descuento)";
+
+        using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
+        {
+            cmd.Parameters.AddWithValue("@Seccion", seccion);
+            cmd.Parameters.AddWithValue("@IdLibro", idLibro);
+            cmd.Parameters.AddWithValue("@PrecioOferta", seccion == "ofertas" && req.PrecioOferta.HasValue ? (object)req.PrecioOferta.Value : DBNull.Value);
+            cmd.Parameters.AddWithValue("@Descuento", seccion == "ofertas" && req.Descuento.HasValue ? (object)req.Descuento.Value : DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    return Results.Ok(new { mensaje = seccion == "ofertas" ? "Libro agregado a ofertas." : "Libro agregado a la sección de inicio." });
+});
+
+app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccionLibro) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string deleteQuery = "delete from Seccion_Libros where id_seccion_libro = @Id";
+        using (SqlCommand cmd = new SqlCommand(deleteQuery, conn))
+        {
+            cmd.Parameters.AddWithValue("@Id", idSeccionLibro);
+            int filas = cmd.ExecuteNonQuery();
+            if (filas == 0)
+            {
+                return Results.NotFound(new { mensaje = "Registro no encontrado." });
+            }
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Libro quitado de la sección." });
+});
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 
@@ -1124,6 +1340,16 @@ record EditarLibroDto(decimal Precio, int Stock);
 record RespuestaMensajeDto(string Respuesta);
 
 record GuardarBannerDto(string? ImagenUrl, string? EnlaceUrl, bool Activo);
+
+record GuardarBannerIntermedioDto(string? ImagenUrl, string? EnlaceUrl, bool Activo);
+
+record AsignarLibroSeccionDto(
+    string? Seccion,
+    string? IdLibro,
+    decimal? PrecioOferta = null,
+    int? Descuento = null
+);
+
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---
 public record CambioPasswordRequest(string Correo, string NuevaPassword);

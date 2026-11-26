@@ -1213,7 +1213,7 @@ app.MapGet("/api/admin/secciones-libros", () =>
         conn.Open();
         string query = @"
             select sl.id_seccion_libro, sl.seccion, sl.id_libro, sl.orden,
-                   sl.precio_oferta, sl.descuento,
+                   sl.precio_oferta, sl.descuento, sl.etiqueta, sl.descripcion,
                    l.Titulo, l.Autor, l.Precio, l.Imagen
             from Seccion_Libros sl
             inner join Libros l on l.id_libro = sl.id_libro
@@ -1232,6 +1232,8 @@ app.MapGet("/api/admin/secciones-libros", () =>
                     orden = Convert.ToInt32(reader["orden"]),
                     precioOferta = reader["precio_oferta"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["precio_oferta"]),
                     descuento = reader["descuento"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["descuento"]),
+                    etiqueta = reader["etiqueta"] == DBNull.Value ? "" : reader["etiqueta"].ToString(),
+                    descripcion = reader["descripcion"] == DBNull.Value ? "" : reader["descripcion"].ToString(),
                     titulo = reader["Titulo"].ToString(),
                     autor = reader["Autor"].ToString(),
                     precio = Convert.ToDecimal(reader["Precio"]),
@@ -1243,13 +1245,16 @@ app.MapGet("/api/admin/secciones-libros", () =>
 
     return Results.Ok(lista);
 });
-
 app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
 {
     string seccion = (req.Seccion ?? "").Trim().ToLower();
     string idLibro = (req.IdLibro ?? "").Trim();
 
-    if (seccion != "recomendaciones" && seccion != "novedades" && seccion != "mas_vendido" && seccion != "ofertas")
+    if (seccion != "recomendaciones" &&
+        seccion != "novedades" &&
+        seccion != "pagina_novedades" &&
+        seccion != "mas_vendido" &&
+        seccion != "ofertas")
     {
         return Results.BadRequest(new { mensaje = "Sección no válida." });
     }
@@ -1264,23 +1269,70 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
         conn.Open();
 
         string existeQuery = @"
-            select count(*) from Seccion_Libros
+            select id_seccion_libro from Seccion_Libros
             where seccion = @Seccion and id_libro = @IdLibro";
 
+        int? idExistente = null;
         using (SqlCommand existeCmd = new SqlCommand(existeQuery, conn))
         {
             existeCmd.Parameters.AddWithValue("@Seccion", seccion);
             existeCmd.Parameters.AddWithValue("@IdLibro", idLibro);
-            int yaEsta = Convert.ToInt32(existeCmd.ExecuteScalar());
-            if (yaEsta > 0)
+            var res = existeCmd.ExecuteScalar();
+            if (res != null && res != DBNull.Value)
             {
-                return Results.BadRequest(new { mensaje = "Ese libro ya está asignado a esta sección." });
+                idExistente = Convert.ToInt32(res);
             }
         }
 
+        if (idExistente.HasValue)
+        {
+            if (seccion == "ofertas" && (req.PrecioOferta.HasValue || req.Descuento.HasValue))
+            {
+                string updateOferta = @"
+                    update Seccion_Libros
+                    set precio_oferta = @PrecioOferta,
+                        descuento = @Descuento
+                    where id_seccion_libro = @Id";
+
+                using (SqlCommand upCmd = new SqlCommand(updateOferta, conn))
+                {
+                    upCmd.Parameters.AddWithValue("@Id", idExistente.Value);
+                    upCmd.Parameters.AddWithValue("@PrecioOferta", req.PrecioOferta.HasValue ? (object)req.PrecioOferta.Value : DBNull.Value);
+                    upCmd.Parameters.AddWithValue("@Descuento", req.Descuento.HasValue ? (object)req.Descuento.Value : DBNull.Value);
+                    upCmd.ExecuteNonQuery();
+                }
+
+                return Results.Ok(new { mensaje = "Oferta actualizada correctamente." });
+            }
+
+            if ((seccion == "novedades" || seccion == "pagina_novedades") &&
+                (!string.IsNullOrWhiteSpace(req.Etiqueta) || !string.IsNullOrWhiteSpace(req.Descripcion)))
+            {
+                string updateNovedad = @"
+                    update Seccion_Libros
+                    set etiqueta = @Etiqueta,
+                        descripcion = @Descripcion
+                    where id_seccion_libro = @Id";
+
+                using (SqlCommand upCmd = new SqlCommand(updateNovedad, conn))
+                {
+                    upCmd.Parameters.AddWithValue("@Id", idExistente.Value);
+                    upCmd.Parameters.AddWithValue("@Etiqueta", string.IsNullOrWhiteSpace(req.Etiqueta) ? DBNull.Value : (object)req.Etiqueta.Trim());
+                    upCmd.Parameters.AddWithValue("@Descripcion", string.IsNullOrWhiteSpace(req.Descripcion) ? DBNull.Value : (object)req.Descripcion.Trim());
+                    upCmd.ExecuteNonQuery();
+                }
+
+                return Results.Ok(new { mensaje = "Novedad actualizada correctamente." });
+            }
+
+            return Results.BadRequest(new { mensaje = "Ese libro ya está asignado a esta sección." });
+        }
+
+        bool esNovedad = seccion == "novedades" || seccion == "pagina_novedades";
+
         string insertQuery = @"
-            insert into Seccion_Libros (seccion, id_libro, orden, fecha_agregado, precio_oferta, descuento)
-            values (@Seccion, @IdLibro, 0, getdate(), @PrecioOferta, @Descuento)";
+            insert into Seccion_Libros (seccion, id_libro, orden, fecha_agregado, precio_oferta, descuento, etiqueta, descripcion)
+            values (@Seccion, @IdLibro, 0, getdate(), @PrecioOferta, @Descuento, @Etiqueta, @Descripcion)";
 
         using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
         {
@@ -1288,11 +1340,21 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
             cmd.Parameters.AddWithValue("@IdLibro", idLibro);
             cmd.Parameters.AddWithValue("@PrecioOferta", seccion == "ofertas" && req.PrecioOferta.HasValue ? (object)req.PrecioOferta.Value : DBNull.Value);
             cmd.Parameters.AddWithValue("@Descuento", seccion == "ofertas" && req.Descuento.HasValue ? (object)req.Descuento.Value : DBNull.Value);
+            cmd.Parameters.AddWithValue("@Etiqueta", esNovedad && !string.IsNullOrWhiteSpace(req.Etiqueta) ? (object)req.Etiqueta.Trim() : DBNull.Value);
+            cmd.Parameters.AddWithValue("@Descripcion", esNovedad && !string.IsNullOrWhiteSpace(req.Descripcion) ? (object)req.Descripcion.Trim() : DBNull.Value);
             cmd.ExecuteNonQuery();
         }
     }
 
-    return Results.Ok(new { mensaje = seccion == "ofertas" ? "Libro agregado a ofertas." : "Libro agregado a la sección de inicio." });
+    string mensaje = seccion == "ofertas"
+        ? "Libro agregado a ofertas."
+        : seccion == "pagina_novedades"
+            ? "Libro agregado a la página de Novedades."
+            : seccion == "novedades"
+                ? "Libro agregado a novedades."
+                : "Libro agregado a la sección de inicio.";
+
+    return Results.Ok(new { mensaje });
 });
 
 app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccionLibro) =>
@@ -1347,9 +1409,10 @@ record AsignarLibroSeccionDto(
     string? Seccion,
     string? IdLibro,
     decimal? PrecioOferta = null,
-    int? Descuento = null
+    int? Descuento = null,
+    string? Etiqueta = null,
+    string? Descripcion = null
 );
-
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---
 public record CambioPasswordRequest(string Correo, string NuevaPassword);

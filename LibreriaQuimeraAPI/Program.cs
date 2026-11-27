@@ -1381,6 +1381,113 @@ app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccion
     return Results.Ok(new { mensaje = "Libro quitado de la sección." });
 });
 
+
+
+
+
+
+
+
+
+
+app.MapGet("/api/centros-recoleccion", () =>
+{
+    var lista = new List<object>();
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            select id_centro, estado, nombre, lat, lng, direccion, horario, instrucciones
+            from Centros_Recoleccion
+            order by estado, id_centro";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                lista.Add(new
+                {
+                    idCentro = reader.GetInt32(0),
+                    estado = reader.GetString(1),
+                    nombre = reader.GetString(2),
+                    lat = reader.GetDouble(3),
+                    lng = reader.GetDouble(4),
+                    direccion = reader.GetString(5),
+                    horario = reader.IsDBNull(6) ? "" : reader.GetString(6),
+                    instrucciones = reader.IsDBNull(7) ? "" : reader.GetString(7)
+                });
+            }
+        }
+    }
+
+    return Results.Ok(lista);
+});
+
+app.MapPost("/api/admin/centros-recoleccion", (CentroRecoleccionDto req) =>
+{
+    string estado = (req.Estado ?? "").Trim();
+    string nombre = (req.Nombre ?? "").Trim();
+    string direccion = (req.Direccion ?? "").Trim();
+    string horario = (req.Horario ?? "").Trim();
+    string instrucciones = (req.Instrucciones ?? "").Trim();
+
+    if (string.IsNullOrWhiteSpace(estado) ||
+        string.IsNullOrWhiteSpace(nombre) ||
+        string.IsNullOrWhiteSpace(direccion) ||
+        !req.Lat.HasValue ||
+        !req.Lng.HasValue)
+    {
+        return Results.BadRequest(new { mensaje = "Completa estado, nombre, latitud, longitud y dirección." });
+    }
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"
+            insert into Centros_Recoleccion (estado, nombre, lat, lng, direccion, horario, instrucciones)
+            values (@Estado, @Nombre, @Lat, @Lng, @Direccion, @Horario, @Instrucciones)";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Estado", estado);
+            cmd.Parameters.AddWithValue("@Nombre", nombre);
+            cmd.Parameters.AddWithValue("@Lat", req.Lat.Value);
+            cmd.Parameters.AddWithValue("@Lng", req.Lng.Value);
+            cmd.Parameters.AddWithValue("@Direccion", direccion);
+            cmd.Parameters.AddWithValue("@Horario", string.IsNullOrWhiteSpace(horario) ? DBNull.Value : (object)horario);
+            cmd.Parameters.AddWithValue("@Instrucciones", string.IsNullOrWhiteSpace(instrucciones) ? DBNull.Value : (object)instrucciones);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Centro de recolección agregado." });
+});
+
+app.MapDelete("/api/admin/centros-recoleccion/{id:int}", (int id) =>
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = "delete from Centros_Recoleccion where id_centro = @Id";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@Id", id);
+            int filas = cmd.ExecuteNonQuery();
+            if (filas == 0)
+            {
+                return Results.NotFound(new { mensaje = "Centro de recolección no encontrado." });
+            }
+        }
+    }
+
+    return Results.Ok(new { mensaje = "Centro de recolección eliminado." });
+});
+
+
+
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
 
@@ -1393,8 +1500,6 @@ record PerfilUpdateDto(
     string? Ciudad,
     string? CodigoPostal
 );
-
-
 
 record NuevoLibroAdminDto(string Titulo, string Autor, decimal Precio, int Stock, string? Imagen, int IdCategoria);
 record EstadoPedidoDto(string Estado);
@@ -1416,6 +1521,16 @@ record AsignarLibroSeccionDto(
     int? Descuento = null,
     string? Etiqueta = null,
     string? Descripcion = null
+);
+
+record CentroRecoleccionDto(
+    string? Estado,
+    string? Nombre,
+    double? Lat,
+    double? Lng,
+    string? Direccion,
+    string? Horario,
+    string? Instrucciones
 );
 
 // --- 3. EL RECORD SIEMPRE VA HASTA ABAJO DE TODO EL ARCHIVO ---

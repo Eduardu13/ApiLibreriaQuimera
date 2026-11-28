@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.Data.SqlClient;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Configurar CORS para permitir peticiones desde tu frontend (HTML/JS)
+// 1. Configurar CORS y caché en memoria
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", policy =>
@@ -18,46 +21,74 @@ builder.Services.AddCors(options =>
     });
 });
 
+builder.Services.AddMemoryCache();
+
 var app = builder.Build();
 app.UseCors("AllowAll");
 
-string connectionString = @"Server=(localdb)\MSSQLLocalDB;Database=LibreriaQuimera;Integrated Security=True;TrustServerCertificate=True;";
+string connectionString =
+    builder.Configuration["ConnectionStrings:DefaultConnection"]
+    ?? builder.Configuration["DefaultConnection"]
+    ?? @"Server=db83098.public.databaseasp.net;Database=db83098;User Id=db83098;Password=H=e86dM-!S4j;Encrypt=True;TrustServerCertificate=True;MultipleActiveResultSets=True;Connect Timeout=60;";
+
+const int comandoTimeoutSegundos = 90;
+
+const string CacheProductos = "productos_catalogo";
+const string CacheCategorias = "admin_categorias";
+const string CacheBannersIntermedios = "banners_intermedios";
+const string CacheBannerPopup = "banner_popup";
+const string CacheSeccionesLibros = "admin_secciones_libros";
+const string CacheCentrosRecoleccion = "centros_recoleccion";
+
+async Task<T> ObtenerEnCache<T>(IMemoryCache cache, string clave, Func<Task<T>> cargarDato, int segundos = 60)
+{
+    if (cache.TryGetValue(clave, out T? valorGuardado) && valorGuardado is not null)
+    {
+        return valorGuardado;
+    }
+
+    T resultado = await cargarDato();
+    cache.Set(clave, resultado, TimeSpan.FromSeconds(segundos));
+    return resultado;
+}
 
 // ==========================================
 // ENDPOINTS DE LA API (Minimal API)
 // ==========================================
 
-app.MapGet("/obtener-productos", () =>
+app.MapGet("/obtener-productos", async (IMemoryCache cache) =>
 {
-    var libros = new List<object>();
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    var libros = await ObtenerEnCache(cache, CacheProductos, async () =>
     {
-        conn.Open();
+        var lista = new List<object>();
+        using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
+
         string query = @"
             SELECT l.id_libro, l.titulo, l.precio, l.stock, l.autor, l.imagen, c.nombre AS categoria 
-            FROM Libros l 
-            INNER JOIN Categorias c ON l.id_categoria = c.id_categoria;";
+            FROM Libros l WITH (NOLOCK)
+            INNER JOIN Categorias c WITH (NOLOCK) ON l.id_categoria = c.id_categoria;";
 
-        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using var cmd = new SqlCommand(query, conn);
+        cmd.CommandTimeout = comandoTimeoutSegundos;
+
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            using (SqlDataReader reader = cmd.ExecuteReader())
+            lista.Add(new
             {
-                while (reader.Read())
-                {
-                    libros.Add(new
-                    {
-                        id = reader["id_libro"].ToString(),
-                        titulo = reader["titulo"].ToString(),
-                        precio = Convert.ToDecimal(reader["precio"]),
-                        stock = Convert.ToInt32(reader["stock"]),
-                        autor = reader["autor"].ToString(),
-                        imagen = reader["imagen"].ToString(),
-                        categoria = reader["categoria"].ToString()
-                    });
-                }
-            }
+                id = reader["id_libro"].ToString(),
+                titulo = reader["titulo"].ToString(),
+                precio = Convert.ToDecimal(reader["precio"]),
+                stock = Convert.ToInt32(reader["stock"]),
+                autor = reader["autor"].ToString(),
+                imagen = reader["imagen"].ToString(),
+                categoria = reader["categoria"].ToString()
+            });
         }
-    }
+        return lista;
+    });
+
     return Results.Ok(libros);
 });
 
@@ -70,6 +101,7 @@ app.MapPost("/api/registro", (UsuarioRegistro request) =>
         string query = "INSERT INTO Usuarios (nombre, apellido, correo, Contrasena, telefono) VALUES (@Nombre, @Apellido, @Correo, @Contrasena, @Telefono)";
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Nombre", request.Nombre);
             cmd.Parameters.AddWithValue("@Apellido", request.Apellido);
             cmd.Parameters.AddWithValue("@Correo", request.Correo);
@@ -95,9 +127,10 @@ app.MapPost("/api/login", (UsuarioLogin request) =>
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
         conn.Open();
-        string query = "SELECT id_usuario, nombre FROM Usuarios WHERE correo = @Correo AND Contrasena = @Contrasena";
+        string query = "SELECT id_usuario, nombre FROM Usuarios WITH (NOLOCK) WHERE correo = @Correo AND Contrasena = @Contrasena";
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Correo", request.Correo);
             cmd.Parameters.AddWithValue("@Contrasena", request.Contrasena);
 
@@ -121,7 +154,7 @@ app.MapPost("/api/login", (UsuarioLogin request) =>
 });
 
 // --- RUTA: Procesar Compra y Actualizar Inventario ---
-app.MapPost("/api/checkout", (CheckoutRequest request) =>
+app.MapPost("/api/checkout", (CheckoutRequest request, IMemoryCache cache) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
@@ -129,11 +162,11 @@ app.MapPost("/api/checkout", (CheckoutRequest request) =>
         SqlTransaction transaction = conn.BeginTransaction();
         try
         {
-            // 1. Insertar en Pedidos
             string queryPedido = "INSERT INTO Pedidos (id_usuario, total, direccion, ciudad, codigo_postal, telefono_envio) OUTPUT INSERTED.id_pedido VALUES (@IdUsuario, @Total, @Direccion, @Ciudad, @CP, @TelEnvio)";
             int idPedido = 0;
             using (SqlCommand cmdPedido = new SqlCommand(queryPedido, conn, transaction))
             {
+                cmdPedido.CommandTimeout = comandoTimeoutSegundos;
                 cmdPedido.Parameters.AddWithValue("@IdUsuario", request.IdUsuario);
                 cmdPedido.Parameters.AddWithValue("@Total", request.Total);
                 cmdPedido.Parameters.AddWithValue("@Direccion", request.Direccion);
@@ -144,12 +177,12 @@ app.MapPost("/api/checkout", (CheckoutRequest request) =>
                 idPedido = (int)cmdPedido.ExecuteScalar();
             }
 
-            // 2. Insertar Detalles del Pedido y actualizar el stock
             foreach (var item in request.Carrito)
             {
                 string queryDetalle = "INSERT INTO Detalles_Pedido (id_pedido, id_libro, cantidad, precio_unitario) VALUES (@IdPedido, @IdLibro, @Cantidad, @Precio)";
                 using (SqlCommand cmdDetalle = new SqlCommand(queryDetalle, conn, transaction))
                 {
+                    cmdDetalle.CommandTimeout = comandoTimeoutSegundos;
                     cmdDetalle.Parameters.AddWithValue("@IdPedido", idPedido);
                     cmdDetalle.Parameters.AddWithValue("@IdLibro", item.IdLibro);
                     cmdDetalle.Parameters.AddWithValue("@Cantidad", item.Cantidad);
@@ -160,6 +193,7 @@ app.MapPost("/api/checkout", (CheckoutRequest request) =>
                 string queryStock = "UPDATE Libros SET stock = stock - @Cantidad WHERE id_libro = @IdLibro";
                 using (SqlCommand cmdStock = new SqlCommand(queryStock, conn, transaction))
                 {
+                    cmdStock.CommandTimeout = comandoTimeoutSegundos;
                     cmdStock.Parameters.AddWithValue("@Cantidad", item.Cantidad);
                     cmdStock.Parameters.AddWithValue("@IdLibro", item.IdLibro);
                     cmdStock.ExecuteNonQuery();
@@ -167,6 +201,7 @@ app.MapPost("/api/checkout", (CheckoutRequest request) =>
             }
 
             transaction.Commit();
+            cache.Remove(CacheProductos);
             return Results.Ok(new { mensaje = "Compra procesada con éxito", idPedido = idPedido });
         }
         catch (Exception ex)
@@ -189,6 +224,7 @@ app.MapPost("/enviar-contacto", (ContactoRequest request) =>
 
             using (SqlCommand cmd = new SqlCommand(query, conn))
             {
+                cmd.CommandTimeout = comandoTimeoutSegundos;
                 cmd.Parameters.AddWithValue("@Nombre", request.Nombre ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("@Telefono", request.Telefono ?? (object)DBNull.Value);
                 cmd.Parameters.AddWithValue("@Correo", request.Correo ?? (object)DBNull.Value);
@@ -213,6 +249,7 @@ app.MapPost("/api/cambiar-password", async (CambioPasswordRequest request) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Contrasena", request.NuevaPassword);
             cmd.Parameters.AddWithValue("@Correo", request.Correo);
 
@@ -247,12 +284,10 @@ string estimarLlegada(string ciudad)
 {
     string t = normalizarTexto(ciudad);
 
-    // 1. Local / Estado base (1 a 2 días hábiles)
     string[] zonaLocal = { "campeche", "ciudad del carmen" };
     if (zonaLocal.Any(x => t.Contains(x)))
         return "1 a 2 días hábiles";
 
-    // 2. Sureste y península (2 a 4 días hábiles)
     string[] zonaSureste = {
         "yucatan", "merida", "valladolid", "tizimin",
         "quintana roo", "cancun", "playa del carmen", "chetumal", "tulum",
@@ -264,7 +299,6 @@ string estimarLlegada(string ciudad)
     if (zonaSureste.Any(x => t.Contains(x)))
         return "2 a 4 días hábiles";
 
-    // 3. Centro, Bajío y Occidente (3 a 5 días hábiles)
     string[] zonaCentro = {
         "ciudad de mexico", "cdmx", "df", "distrito federal",
         "estado de mexico", "edomex", "toluca", "ecatepec", "nezahualcoyotl", "naucalpan",
@@ -286,7 +320,6 @@ string estimarLlegada(string ciudad)
     if (zonaCentro.Any(x => t.Contains(x)))
         return "3 a 5 días hábiles";
 
-    // 4. Norte y Noroeste (4 a 6 días hábiles)
     string[] zonaNorte = {
         "nuevo leon", "monterrey", "san nicolas", "guadalupe", "apodaca",
         "coahuila", "saltillo", "torreon",
@@ -321,17 +354,18 @@ app.MapGet("/mis-compras/{idUsuario}", (int idUsuario) =>
                 isnull(p.estado, 'Pendiente') as estado,
                 stuff((
                     select ' | ' + l.titulo + ' (x' + cast(d.cantidad as varchar(10)) + ')'
-                    from Detalles_Pedido d
-                    inner join Libros l on d.id_libro = l.id_libro
+                    from Detalles_Pedido d WITH (NOLOCK)
+                    inner join Libros l WITH (NOLOCK) on d.id_libro = l.id_libro
                     where d.id_pedido = p.id_pedido
                     for xml path(''), type
                 ).value('.', 'nvarchar(max)'), 1, 3, '') as libros
-            from Pedidos p
+            from Pedidos p WITH (NOLOCK)
             where p.id_usuario = @IdUsuario
             order by p.id_pedido desc";
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@IdUsuario", idUsuario);
             using (SqlDataReader reader = cmd.ExecuteReader())
             {
@@ -375,18 +409,19 @@ app.MapGet("/mis-compras-correo/{correo}", (string correo) =>
                 isnull(p.estado, 'Pendiente') as estado,
                 stuff((
                     select ', ' + l.titulo + ' (x' + cast(d.cantidad as varchar(10)) + ')'
-                    from Detalles_Pedido d
-                    inner join Libros l on d.id_libro = l.id_libro
+                    from Detalles_Pedido d WITH (NOLOCK)
+                    inner join Libros l WITH (NOLOCK) on d.id_libro = l.id_libro
                     where d.id_pedido = p.id_pedido
                     for xml path(''), type
                 ).value('.', 'nvarchar(max)'), 1, 2, '') as libros
-            from Pedidos p
-            inner join Usuarios u on p.id_usuario = u.id_usuario
+            from Pedidos p WITH (NOLOCK)
+            inner join Usuarios u WITH (NOLOCK) on p.id_usuario = u.id_usuario
             where u.correo = @Correo
             order by p.id_pedido desc";
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Correo", correo);
             using (SqlDataReader reader = cmd.ExecuteReader())
             {
@@ -413,7 +448,7 @@ app.MapGet("/mis-compras-correo/{correo}", (string correo) =>
 });
 
 // --- RUTA: Cancelar Compra y Devolver Stock ---
-app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
+app.MapPost("/cancelar-compra/{idPedido}", (int idPedido, IMemoryCache cache) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
@@ -431,6 +466,7 @@ app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
 
             using (SqlCommand cmdStock = new SqlCommand(queryStock, conn, transaccion))
             {
+                cmdStock.CommandTimeout = comandoTimeoutSegundos;
                 cmdStock.Parameters.AddWithValue("@IdPedido", idPedido);
                 cmdStock.ExecuteNonQuery();
             }
@@ -438,11 +474,13 @@ app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
             string queryEstado = "update Pedidos set estado = 'Cancelado' where id_pedido = @IdPedido";
             using (SqlCommand cmdEstado = new SqlCommand(queryEstado, conn, transaccion))
             {
+                cmdEstado.CommandTimeout = comandoTimeoutSegundos;
                 cmdEstado.Parameters.AddWithValue("@IdPedido", idPedido);
                 cmdEstado.ExecuteNonQuery();
             }
 
             transaccion.Commit();
+            cache.Remove(CacheProductos);
             return Results.Ok(new { exito = true, mensaje = "Compra cancelada y stock devuelto." });
         }
         catch (Exception ex)
@@ -452,9 +490,6 @@ app.MapPost("/cancelar-compra/{idPedido}", (int idPedido) =>
         }
     }
 });
-
-
-
 
 // --- RUTA: Eliminar Comentario de Contacto ---
 app.MapDelete("/eliminar-comentario/{idMensaje}", (int idMensaje) =>
@@ -466,6 +501,7 @@ app.MapDelete("/eliminar-comentario/{idMensaje}", (int idMensaje) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@IdMensaje", idMensaje);
             int filas = cmd.ExecuteNonQuery();
 
@@ -478,10 +514,6 @@ app.MapDelete("/eliminar-comentario/{idMensaje}", (int idMensaje) =>
     }
 });
 
-
-
-
-
 // --- RUTA: Obtener datos del perfil por ID ---
 app.MapGet("/api/perfil/{idUsuario}", (int idUsuario) =>
 {
@@ -490,11 +522,12 @@ app.MapGet("/api/perfil/{idUsuario}", (int idUsuario) =>
         conn.Open();
         string query = @"
             select id_usuario, nombre, apellido, correo, telefono, direccion, ciudad, codigo_postal
-            from Usuarios
+            from Usuarios WITH (NOLOCK)
             where id_usuario = @IdUsuario";
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@IdUsuario", idUsuario);
             using (SqlDataReader reader = cmd.ExecuteReader())
             {
@@ -548,6 +581,7 @@ app.MapPut("/api/perfil/{idUsuario}", (int idUsuario, PerfilUpdateDto datos) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@IdUsuario", idUsuario);
             cmd.Parameters.AddWithValue("@Nombre", datos.Nombre.Trim());
             cmd.Parameters.AddWithValue("@Apellido", (datos.Apellido ?? "").Trim());
@@ -568,39 +602,34 @@ app.MapPut("/api/perfil/{idUsuario}", (int idUsuario, PerfilUpdateDto datos) =>
     return Results.Ok(new { mensaje = "Perfil actualizado correctamente." });
 });
 
-
-
-
-
-
-
 // --- ADMIN: Obtener categorías para formulario de libros ---
-app.MapGet("/api/admin/categorias", () =>
+app.MapGet("/api/admin/categorias", async (IMemoryCache cache) =>
 {
-    var categorias = new List<object>();
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    var categorias = await ObtenerEnCache(cache, CacheCategorias, async () =>
     {
-        conn.Open();
-        string query = "select id_categoria, nombre from Categorias order by id_categoria";
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
+        var lista = new List<object>();
+        using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
+        string query = "select id_categoria, nombre from Categorias WITH (NOLOCK) order by id_categoria";
+        using var cmd = new SqlCommand(query, conn);
+        cmd.CommandTimeout = comandoTimeoutSegundos;
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            while (reader.Read())
+            lista.Add(new
             {
-                categorias.Add(new
-                {
-                    idCategoria = Convert.ToInt32(reader["id_categoria"]),
-                    nombre = reader["nombre"].ToString() ?? ""
-                });
-            }
+                idCategoria = Convert.ToInt32(reader["id_categoria"]),
+                nombre = reader["nombre"].ToString() ?? ""
+            });
         }
-    }
+        return lista;
+    });
+
     return Results.Ok(categorias);
 });
 
 // --- ADMIN: Agregar nuevo libro ---
-// --- ADMIN: Agregar nuevo libro ---
-app.MapPost("/api/admin/libros", (NuevoLibroAdminDto libro) =>
+app.MapPost("/api/admin/libros", (NuevoLibroAdminDto libro, IMemoryCache cache) =>
 {
     if (string.IsNullOrWhiteSpace(libro.Titulo) || string.IsNullOrWhiteSpace(libro.Autor))
         return Results.BadRequest(new { mensaje = "Título y autor son obligatorios." });
@@ -612,19 +641,21 @@ app.MapPost("/api/admin/libros", (NuevoLibroAdminDto libro) =>
     {
         conn.Open();
 
-        // Buscamos el número más alto dentro de los id_libro existentes (ej. 'libroRomance-20' -> 20)
         int maxNum = 0;
-        string queryIds = "select id_libro from Libros";
+        string queryIds = "select id_libro from Libros WITH (NOLOCK)";
         using (SqlCommand cmdIds = new SqlCommand(queryIds, conn))
-        using (SqlDataReader readerIds = cmdIds.ExecuteReader())
         {
-            while (readerIds.Read())
+            cmdIds.CommandTimeout = comandoTimeoutSegundos;
+            using (SqlDataReader readerIds = cmdIds.ExecuteReader())
             {
-                string idTexto = readerIds["id_libro"]?.ToString() ?? "";
-                string soloDigitos = new string(idTexto.Where(char.IsDigit).ToArray());
-                if (int.TryParse(soloDigitos, out int num) && num > maxNum)
+                while (readerIds.Read())
                 {
-                    maxNum = num;
+                    string idTexto = readerIds["id_libro"]?.ToString() ?? "";
+                    string soloDigitos = new string(idTexto.Where(char.IsDigit).ToArray());
+                    if (int.TryParse(soloDigitos, out int num) && num > maxNum)
+                    {
+                        maxNum = num;
+                    }
                 }
             }
         }
@@ -637,6 +668,7 @@ app.MapPost("/api/admin/libros", (NuevoLibroAdminDto libro) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@IdLibro", nuevoIdLibro);
             cmd.Parameters.AddWithValue("@Titulo", libro.Titulo.Trim());
             cmd.Parameters.AddWithValue("@Autor", libro.Autor.Trim());
@@ -649,6 +681,7 @@ app.MapPost("/api/admin/libros", (NuevoLibroAdminDto libro) =>
         }
     }
 
+    cache.Remove(CacheProductos);
     return Results.Ok(new { mensaje = "Libro agregado correctamente al catálogo." });
 });
 
@@ -670,31 +703,34 @@ app.MapGet("/api/admin/pedidos", () =>
                 u.correo,
                 stuff((
                     select ' | ' + l.titulo + ' (x' + cast(d.cantidad as varchar(10)) + ')'
-                    from Detalles_Pedido d
-                    inner join Libros l on d.id_libro = l.id_libro
+                    from Detalles_Pedido d WITH (NOLOCK)
+                    inner join Libros l WITH (NOLOCK) on d.id_libro = l.id_libro
                     where d.id_pedido = p.id_pedido
                     for xml path(''), type
                 ).value('.', 'nvarchar(max)'), 1, 3, '') as libros
-            from Pedidos p
-            left join Usuarios u on p.id_usuario = u.id_usuario
+            from Pedidos p WITH (NOLOCK)
+            left join Usuarios u WITH (NOLOCK) on p.id_usuario = u.id_usuario
             order by p.id_pedido desc";
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
         {
-            while (reader.Read())
+            cmd.CommandTimeout = comandoTimeoutSegundos;
+            using (SqlDataReader reader = cmd.ExecuteReader())
             {
-                pedidos.Add(new
+                while (reader.Read())
                 {
-                    idPedido = Convert.ToInt32(reader["id_pedido"]),
-                    total = Convert.ToDecimal(reader["total"]),
-                    direccion = reader["direccion"] == DBNull.Value ? "" : reader["direccion"].ToString(),
-                    ciudad = reader["ciudad"] == DBNull.Value ? "" : reader["ciudad"].ToString(),
-                    estado = reader["estado"]?.ToString() ?? "Pendiente",
-                    cliente = reader["cliente"] == DBNull.Value ? "Cliente" : reader["cliente"].ToString(),
-                    correo = reader["correo"] == DBNull.Value ? "" : reader["correo"].ToString(),
-                    libros = reader["libros"] == DBNull.Value ? "Sin detalle" : reader["libros"].ToString()
-                });
+                    pedidos.Add(new
+                    {
+                        idPedido = Convert.ToInt32(reader["id_pedido"]),
+                        total = Convert.ToDecimal(reader["total"]),
+                        direccion = reader["direccion"] == DBNull.Value ? "" : reader["direccion"].ToString(),
+                        ciudad = reader["ciudad"] == DBNull.Value ? "" : reader["ciudad"].ToString(),
+                        estado = reader["estado"]?.ToString() ?? "Pendiente",
+                        cliente = reader["cliente"] == DBNull.Value ? "Cliente" : reader["cliente"].ToString(),
+                        correo = reader["correo"] == DBNull.Value ? "" : reader["correo"].ToString(),
+                        libros = reader["libros"] == DBNull.Value ? "Sin detalle" : reader["libros"].ToString()
+                    });
+                }
             }
         }
     }
@@ -713,6 +749,7 @@ app.MapPut("/api/admin/pedidos/{idPedido}/estado", (int idPedido, EstadoPedidoDt
         string query = "update Pedidos set estado = @Estado where id_pedido = @IdPedido";
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Estado", req.Estado.Trim());
             cmd.Parameters.AddWithValue("@IdPedido", idPedido);
             int filas = cmd.ExecuteNonQuery();
@@ -723,11 +760,8 @@ app.MapPut("/api/admin/pedidos/{idPedido}/estado", (int idPedido, EstadoPedidoDt
     return Results.Ok(new { mensaje = "Estado actualizado correctamente." });
 });
 
-
-
-
 // --- ADMIN: Eliminar libro del catálogo ---
-app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro) =>
+app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro, IMemoryCache cache) =>
 {
     if (string.IsNullOrWhiteSpace(idLibro))
         return Results.BadRequest(new { mensaje = "ID de libro no válido." });
@@ -741,6 +775,7 @@ app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@IdLibro", idLimpio);
 
             try
@@ -749,6 +784,8 @@ app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro) =>
                 if (filas == 0)
                     return Results.NotFound(new { mensaje = $"No se encontró el libro con ID '{idLimpio}'." });
 
+                cache.Remove(CacheProductos);
+                cache.Remove(CacheSeccionesLibros);
                 return Results.Ok(new { mensaje = "Libro eliminado correctamente." });
             }
             catch (SqlException)
@@ -759,15 +796,10 @@ app.MapDelete("/api/admin/libros/{idLibro}", (string idLibro) =>
     }
 });
 
-
 app.MapGet("/api/admin/ping", () => Results.Ok(new { ok = true, mensaje = "API actualizada" }));
 
-
-
-
-
 // --- ADMIN: Crear nueva categoría ---
-app.MapPost("/api/admin/categorias", (NuevaCategoriaDto req) =>
+app.MapPost("/api/admin/categorias", (NuevaCategoriaDto req, IMemoryCache cache) =>
 {
     if (string.IsNullOrWhiteSpace(req.Nombre))
         return Results.BadRequest(new { mensaje = "El nombre de la categoría es obligatorio." });
@@ -778,10 +810,10 @@ app.MapPost("/api/admin/categorias", (NuevaCategoriaDto req) =>
     {
         conn.Open();
 
-        // Evita duplicados (ignorando mayúsculas/minúsculas)
-        string queryExiste = "select count(*) from Categorias where lower(nombre) = lower(@Nombre)";
+        string queryExiste = "select count(*) from Categorias WITH (NOLOCK) where lower(nombre) = lower(@Nombre)";
         using (SqlCommand cmdExiste = new SqlCommand(queryExiste, conn))
         {
+            cmdExiste.CommandTimeout = comandoTimeoutSegundos;
             cmdExiste.Parameters.AddWithValue("@Nombre", nombreLimpio);
             int existe = (int)cmdExiste.ExecuteScalar();
             if (existe > 0)
@@ -791,27 +823,28 @@ app.MapPost("/api/admin/categorias", (NuevaCategoriaDto req) =>
         string queryInsert = "insert into Categorias (nombre) values (@Nombre)";
         using (SqlCommand cmdInsert = new SqlCommand(queryInsert, conn))
         {
+            cmdInsert.CommandTimeout = comandoTimeoutSegundos;
             cmdInsert.Parameters.AddWithValue("@Nombre", nombreLimpio);
             cmdInsert.ExecuteNonQuery();
         }
     }
 
+    cache.Remove(CacheCategorias);
+    cache.Remove(CacheProductos);
     return Results.Ok(new { mensaje = $"Categoría '{nombreLimpio}' creada correctamente." });
 });
 
-
-
-
 // --- ADMIN: Eliminar categoría ---
-app.MapDelete("/api/admin/categorias/{id:int}", (int id) =>
+app.MapDelete("/api/admin/categorias/{id:int}", (int id, IMemoryCache cache) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
         conn.Open();
 
-        string queryLibros = "select count(*) from Libros where id_categoria = @Id";
+        string queryLibros = "select count(*) from Libros WITH (NOLOCK) where id_categoria = @Id";
         using (SqlCommand cmdLibros = new SqlCommand(queryLibros, conn))
         {
+            cmdLibros.CommandTimeout = comandoTimeoutSegundos;
             cmdLibros.Parameters.AddWithValue("@Id", id);
             int totalLibros = (int)cmdLibros.ExecuteScalar();
             if (totalLibros > 0)
@@ -821,6 +854,7 @@ app.MapDelete("/api/admin/categorias/{id:int}", (int id) =>
         string queryDelete = "delete from Categorias where id_categoria = @Id";
         using (SqlCommand cmdDelete = new SqlCommand(queryDelete, conn))
         {
+            cmdDelete.CommandTimeout = comandoTimeoutSegundos;
             cmdDelete.Parameters.AddWithValue("@Id", id);
             int filas = cmdDelete.ExecuteNonQuery();
             if (filas == 0)
@@ -828,14 +862,13 @@ app.MapDelete("/api/admin/categorias/{id:int}", (int id) =>
         }
     }
 
+    cache.Remove(CacheCategorias);
+    cache.Remove(CacheProductos);
     return Results.Ok(new { mensaje = "Categoría eliminada correctamente." });
 });
 
-
-
-
 // --- ADMIN: Editar libro (precio, stock, etc.) ---
-app.MapPut("/api/admin/libros/{id}", (string id, EditarLibroDto req) =>
+app.MapPut("/api/admin/libros/{id}", (string id, EditarLibroDto req, IMemoryCache cache) =>
 {
     if (req.Precio < 0 || req.Stock < 0)
         return Results.BadRequest(new { mensaje = "El precio y el stock no pueden ser negativos." });
@@ -854,6 +887,7 @@ app.MapPut("/api/admin/libros/{id}", (string id, EditarLibroDto req) =>
 
         using (SqlCommand cmd = new SqlCommand(queryUpdate, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Id", idLimpio);
             cmd.Parameters.AddWithValue("@Precio", req.Precio);
             cmd.Parameters.AddWithValue("@Stock", req.Stock);
@@ -864,16 +898,12 @@ app.MapPut("/api/admin/libros/{id}", (string id, EditarLibroDto req) =>
         }
     }
 
+    cache.Remove(CacheProductos);
+    cache.Remove(CacheSeccionesLibros);
     return Results.Ok(new { mensaje = "Libro actualizado correctamente." });
 });
 
-
-
-
-
-
 // --- RUTA ACTUALIZADA: Ver Comentarios y Respuestas del Usuario ---
-
 app.MapGet("/mis-comentarios/{correo}", (string correo) =>
 {
     var listaComentarios = new List<object>();
@@ -886,12 +916,13 @@ app.MapGet("/mis-comentarios/{correo}", (string correo) =>
             string query = @"
                 select id_mensaje, nombre, telefono, correo, mensaje, fecha_envio,
                        respuesta_admin, fecha_respuesta, isnull(leido_usuario, 0) as leido_usuario
-                from Mensajes_Contacto
+                from Mensajes_Contacto WITH (NOLOCK)
                 where lower(ltrim(rtrim(correo))) = lower(ltrim(rtrim(@Correo)))
                 order by fecha_envio desc, id_mensaje desc";
 
             using (SqlCommand cmd = new SqlCommand(query, conn))
             {
+                cmd.CommandTimeout = comandoTimeoutSegundos;
                 cmd.Parameters.AddWithValue("@Correo", correo);
                 using (SqlDataReader reader = cmd.ExecuteReader())
                 {
@@ -928,7 +959,6 @@ app.MapGet("/mis-comentarios/{correo}", (string correo) =>
     }
 });
 
-
 // --- RUTA: Marcar respuesta como leída por el usuario ---
 app.MapPut("/api/comentarios/{idMensaje:int}/leido", (int idMensaje) =>
 {
@@ -938,6 +968,7 @@ app.MapPut("/api/comentarios/{idMensaje:int}/leido", (int idMensaje) =>
         string query = "update Mensajes_Contacto set leido_usuario = 1 where id_mensaje = @Id";
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Id", idMensaje);
             cmd.ExecuteNonQuery();
         }
@@ -954,25 +985,28 @@ app.MapGet("/api/admin/mensajes", () =>
         conn.Open();
         string query = @"
             select id_mensaje, nombre, telefono, correo, mensaje, fecha_envio, respuesta_admin, fecha_respuesta
-            from Mensajes_Contacto
+            from Mensajes_Contacto WITH (NOLOCK)
             order by fecha_envio desc, id_mensaje desc";
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
         {
-            while (reader.Read())
+            cmd.CommandTimeout = comandoTimeoutSegundos;
+            using (SqlDataReader reader = cmd.ExecuteReader())
             {
-                mensajes.Add(new
+                while (reader.Read())
                 {
-                    idMensaje = Convert.ToInt32(reader["id_mensaje"]),
-                    nombre = reader["nombre"] == DBNull.Value ? "Anónimo" : reader["nombre"].ToString(),
-                    telefono = reader["telefono"] == DBNull.Value ? "" : reader["telefono"].ToString(),
-                    correo = reader["correo"] == DBNull.Value ? "" : reader["correo"].ToString(),
-                    mensaje = reader["mensaje"] == DBNull.Value ? "" : reader["mensaje"].ToString(),
-                    fechaEnvio = reader["fecha_envio"] == DBNull.Value ? "" : Convert.ToDateTime(reader["fecha_envio"]).ToString("dd/MM/yyyy HH:mm"),
-                    respuestaAdmin = reader["respuesta_admin"] == DBNull.Value ? null : reader["respuesta_admin"].ToString(),
-                    fechaRespuesta = reader["fecha_respuesta"] == DBNull.Value ? null : Convert.ToDateTime(reader["fecha_respuesta"]).ToString("dd/MM/yyyy HH:mm")
-                });
+                    mensajes.Add(new
+                    {
+                        idMensaje = Convert.ToInt32(reader["id_mensaje"]),
+                        nombre = reader["nombre"] == DBNull.Value ? "Anónimo" : reader["nombre"].ToString(),
+                        telefono = reader["telefono"] == DBNull.Value ? "" : reader["telefono"].ToString(),
+                        correo = reader["correo"] == DBNull.Value ? "" : reader["correo"].ToString(),
+                        mensaje = reader["mensaje"] == DBNull.Value ? "" : reader["mensaje"].ToString(),
+                        fechaEnvio = reader["fecha_envio"] == DBNull.Value ? "" : Convert.ToDateTime(reader["fecha_envio"]).ToString("dd/MM/yyyy HH:mm"),
+                        respuestaAdmin = reader["respuesta_admin"] == DBNull.Value ? null : reader["respuesta_admin"].ToString(),
+                        fechaRespuesta = reader["fecha_respuesta"] == DBNull.Value ? null : Convert.ToDateTime(reader["fecha_respuesta"]).ToString("dd/MM/yyyy HH:mm")
+                    });
+                }
             }
         }
     }
@@ -997,6 +1031,7 @@ app.MapPut("/api/admin/mensajes/{idMensaje:int}/responder", (int idMensaje, Resp
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Respuesta", req.Respuesta.Trim());
             cmd.Parameters.AddWithValue("@Id", idMensaje);
             int filas = cmd.ExecuteNonQuery();
@@ -1007,58 +1042,54 @@ app.MapPut("/api/admin/mensajes/{idMensaje:int}/responder", (int idMensaje, Resp
     return Results.Ok(new { mensaje = "Respuesta enviada correctamente." });
 });
 
-
-
-
-
-
-
-
-app.MapGet("/api/banner-popup", () =>
+app.MapGet("/api/banner-popup", async (IMemoryCache cache) =>
 {
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    var banner = await ObtenerEnCache(cache, CacheBannerPopup, async () =>
     {
-        conn.Open();
+        using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
         string query = @"
             select top 1 id_banner, imagen_url, enlace_url, activo
-            from Banner_Popup
+            from Banner_Popup WITH (NOLOCK)
             order by id_banner desc";
 
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
+        using var cmd = new SqlCommand(query, conn);
+        cmd.CommandTimeout = comandoTimeoutSegundos;
+        using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
         {
-            if (reader.Read())
+            return new
             {
-                return Results.Ok(new
-                {
-                    idBanner = Convert.ToInt32(reader["id_banner"]),
-                    imagenUrl = reader["imagen_url"] == DBNull.Value ? "" : reader["imagen_url"].ToString(),
-                    enlaceUrl = reader["enlace_url"] == DBNull.Value ? "ofertas.html" : reader["enlace_url"].ToString(),
-                    activo = reader["activo"] != DBNull.Value && Convert.ToBoolean(reader["activo"])
-                });
-            }
+                idBanner = Convert.ToInt32(reader["id_banner"]),
+                imagenUrl = reader["imagen_url"] == DBNull.Value ? "" : reader["imagen_url"].ToString(),
+                enlaceUrl = reader["enlace_url"] == DBNull.Value ? "ofertas.html" : reader["enlace_url"].ToString(),
+                activo = reader["activo"] != DBNull.Value && Convert.ToBoolean(reader["activo"])
+            };
         }
-    }
 
-    return Results.Ok(new
-    {
-        idBanner = 0,
-        imagenUrl = "",
-        enlaceUrl = "ofertas.html",
-        activo = false
+        return new
+        {
+            idBanner = 0,
+            imagenUrl = "",
+            enlaceUrl = "ofertas.html",
+            activo = false
+        };
     });
+
+    return Results.Ok(banner);
 });
 
-app.MapPut("/api/banner-popup", (GuardarBannerDto req) =>
+app.MapPut("/api/banner-popup", (GuardarBannerDto req, IMemoryCache cache) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
         conn.Open();
 
-        string checkQuery = "select count(*) from Banner_Popup";
+        string checkQuery = "select count(*) from Banner_Popup WITH (NOLOCK)";
         int total;
         using (SqlCommand checkCmd = new SqlCommand(checkQuery, conn))
         {
+            checkCmd.CommandTimeout = comandoTimeoutSegundos;
             total = Convert.ToInt32(checkCmd.ExecuteScalar());
         }
 
@@ -1070,6 +1101,7 @@ app.MapPut("/api/banner-popup", (GuardarBannerDto req) =>
 
             using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
             {
+                cmd.CommandTimeout = comandoTimeoutSegundos;
                 cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@EnlaceUrl", string.IsNullOrWhiteSpace(req.EnlaceUrl) ? "ofertas.html" : req.EnlaceUrl.Trim());
                 cmd.Parameters.AddWithValue("@Activo", req.Activo);
@@ -1087,6 +1119,7 @@ app.MapPut("/api/banner-popup", (GuardarBannerDto req) =>
 
             using (SqlCommand cmd = new SqlCommand(updateQuery, conn))
             {
+                cmd.CommandTimeout = comandoTimeoutSegundos;
                 cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@EnlaceUrl", string.IsNullOrWhiteSpace(req.EnlaceUrl) ? "ofertas.html" : req.EnlaceUrl.Trim());
                 cmd.Parameters.AddWithValue("@Activo", req.Activo);
@@ -1095,48 +1128,41 @@ app.MapPut("/api/banner-popup", (GuardarBannerDto req) =>
         }
     }
 
+    cache.Remove(CacheBannerPopup);
     return Results.Ok(new { mensaje = "Banner actualizado correctamente." });
 });
 
-
-
-
-
-
-
-
-
-app.MapGet("/api/banners-intermedios", () =>
+app.MapGet("/api/banners-intermedios", async (IMemoryCache cache) =>
 {
-    var lista = new List<object>();
-
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    var lista = await ObtenerEnCache(cache, CacheBannersIntermedios, async () =>
     {
-        conn.Open();
+        var items = new List<object>();
+        using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
         string query = @"
             select clave_banner, imagen_url, enlace_url, activo
-            from Banners_Intermedios";
+            from Banners_Intermedios WITH (NOLOCK)";
 
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
+        using var cmd = new SqlCommand(query, conn);
+        cmd.CommandTimeout = comandoTimeoutSegundos;
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            while (reader.Read())
+            items.Add(new
             {
-                lista.Add(new
-                {
-                    claveBanner = reader["clave_banner"].ToString(),
-                    imagenUrl = reader["imagen_url"] == DBNull.Value ? "" : reader["imagen_url"].ToString(),
-                    enlaceUrl = reader["enlace_url"] == DBNull.Value ? "" : reader["enlace_url"].ToString(),
-                    activo = reader["activo"] != DBNull.Value && Convert.ToBoolean(reader["activo"])
-                });
-            }
+                claveBanner = reader["clave_banner"].ToString(),
+                imagenUrl = reader["imagen_url"] == DBNull.Value ? "" : reader["imagen_url"].ToString(),
+                enlaceUrl = reader["enlace_url"] == DBNull.Value ? "" : reader["enlace_url"].ToString(),
+                activo = reader["activo"] != DBNull.Value && Convert.ToBoolean(reader["activo"])
+            });
         }
-    }
+        return items;
+    });
 
     return Results.Ok(lista);
 });
 
-app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerIntermedioDto req) =>
+app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerIntermedioDto req, IMemoryCache cache) =>
 {
     string claveLimpia = (clave ?? "").Trim().ToLower();
     if (claveLimpia != "contacto" && claveLimpia != "ofertas")
@@ -1151,10 +1177,11 @@ app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerInter
     {
         conn.Open();
 
-        string checkQuery = "select count(*) from Banners_Intermedios where clave_banner = @Clave";
+        string checkQuery = "select count(*) from Banners_Intermedios WITH (NOLOCK) where clave_banner = @Clave";
         int existe;
         using (SqlCommand checkCmd = new SqlCommand(checkQuery, conn))
         {
+            checkCmd.CommandTimeout = comandoTimeoutSegundos;
             checkCmd.Parameters.AddWithValue("@Clave", claveLimpia);
             existe = Convert.ToInt32(checkCmd.ExecuteScalar());
         }
@@ -1167,6 +1194,7 @@ app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerInter
 
             using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
             {
+                cmd.CommandTimeout = comandoTimeoutSegundos;
                 cmd.Parameters.AddWithValue("@Clave", claveLimpia);
                 cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@EnlaceUrl", enlaceFinal);
@@ -1186,6 +1214,7 @@ app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerInter
 
             using (SqlCommand cmd = new SqlCommand(updateQuery, conn))
             {
+                cmd.CommandTimeout = comandoTimeoutSegundos;
                 cmd.Parameters.AddWithValue("@Clave", claveLimpia);
                 cmd.Parameters.AddWithValue("@ImagenUrl", (object?)req.ImagenUrl ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@EnlaceUrl", enlaceFinal);
@@ -1195,58 +1224,53 @@ app.MapPut("/api/banners-intermedios/{clave}", (string clave, GuardarBannerInter
         }
     }
 
+    cache.Remove(CacheBannersIntermedios);
     return Results.Ok(new { mensaje = "Banner intermedio actualizado correctamente." });
 });
 
-
-
-
-
-
-
-app.MapGet("/api/admin/secciones-libros", () =>
+app.MapGet("/api/admin/secciones-libros", async (IMemoryCache cache) =>
 {
-    var lista = new List<object>();
-
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    var lista = await ObtenerEnCache(cache, CacheSeccionesLibros, async () =>
     {
-        conn.Open();
+        var items = new List<object>();
+        using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
         string query = @"
             select sl.id_seccion_libro, sl.seccion, sl.id_libro, sl.orden,
                    sl.precio_oferta, sl.descuento, sl.etiqueta, sl.descripcion,
                    l.Titulo, l.Autor, l.Precio, l.Imagen
-            from Seccion_Libros sl
-            inner join Libros l on l.id_libro = sl.id_libro
+            from Seccion_Libros sl WITH (NOLOCK)
+            inner join Libros l WITH (NOLOCK) on l.id_libro = sl.id_libro
             order by sl.seccion, sl.orden, sl.id_seccion_libro desc";
 
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
+        using var cmd = new SqlCommand(query, conn);
+        cmd.CommandTimeout = comandoTimeoutSegundos;
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            while (reader.Read())
+            items.Add(new
             {
-                lista.Add(new
-                {
-                    idSeccionLibro = Convert.ToInt32(reader["id_seccion_libro"]),
-                    seccion = reader["seccion"].ToString(),
-                    idLibro = reader["id_libro"].ToString(),
-                    orden = Convert.ToInt32(reader["orden"]),
-                    precioOferta = reader["precio_oferta"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["precio_oferta"]),
-                    descuento = reader["descuento"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["descuento"]),
-                    etiqueta = reader["etiqueta"] == DBNull.Value ? "" : reader["etiqueta"].ToString(),
-                    descripcion = reader["descripcion"] == DBNull.Value ? "" : reader["descripcion"].ToString(),
-                    titulo = reader["Titulo"].ToString(),
-                    autor = reader["Autor"].ToString(),
-                    precio = Convert.ToDecimal(reader["Precio"]),
-                    imagen = reader["Imagen"] == DBNull.Value ? "" : reader["Imagen"].ToString()
-                });
-            }
+                idSeccionLibro = Convert.ToInt32(reader["id_seccion_libro"]),
+                seccion = reader["seccion"].ToString(),
+                idLibro = reader["id_libro"].ToString(),
+                orden = Convert.ToInt32(reader["orden"]),
+                precioOferta = reader["precio_oferta"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["precio_oferta"]),
+                descuento = reader["descuento"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["descuento"]),
+                etiqueta = reader["etiqueta"] == DBNull.Value ? "" : reader["etiqueta"].ToString(),
+                descripcion = reader["descripcion"] == DBNull.Value ? "" : reader["descripcion"].ToString(),
+                titulo = reader["Titulo"].ToString(),
+                autor = reader["Autor"].ToString(),
+                precio = Convert.ToDecimal(reader["Precio"]),
+                imagen = reader["Imagen"] == DBNull.Value ? "" : reader["Imagen"].ToString()
+            });
         }
-    }
+        return items;
+    });
 
     return Results.Ok(lista);
 });
 
-app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
+app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req, IMemoryCache cache) =>
 {
     string seccion = (req.Seccion ?? "").Trim().ToLower();
     string idLibro = (req.IdLibro ?? "").Trim();
@@ -1271,12 +1295,13 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
         conn.Open();
 
         string existeQuery = @"
-            select id_seccion_libro from Seccion_Libros
+            select id_seccion_libro from Seccion_Libros WITH (NOLOCK)
             where seccion = @Seccion and id_libro = @IdLibro";
 
         int? idExistente = null;
         using (SqlCommand existeCmd = new SqlCommand(existeQuery, conn))
         {
+            existeCmd.CommandTimeout = comandoTimeoutSegundos;
             existeCmd.Parameters.AddWithValue("@Seccion", seccion);
             existeCmd.Parameters.AddWithValue("@IdLibro", idLibro);
             var res = existeCmd.ExecuteScalar();
@@ -1298,12 +1323,14 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
 
                 using (SqlCommand upCmd = new SqlCommand(updateOferta, conn))
                 {
+                    upCmd.CommandTimeout = comandoTimeoutSegundos;
                     upCmd.Parameters.AddWithValue("@Id", idExistente.Value);
                     upCmd.Parameters.AddWithValue("@PrecioOferta", req.PrecioOferta.HasValue ? (object)req.PrecioOferta.Value : DBNull.Value);
                     upCmd.Parameters.AddWithValue("@Descuento", req.Descuento.HasValue ? (object)req.Descuento.Value : DBNull.Value);
                     upCmd.ExecuteNonQuery();
                 }
 
+                cache.Remove(CacheSeccionesLibros);
                 return Results.Ok(new { mensaje = "Oferta actualizada correctamente." });
             }
 
@@ -1318,12 +1345,14 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
 
                 using (SqlCommand upCmd = new SqlCommand(updateNovedad, conn))
                 {
+                    upCmd.CommandTimeout = comandoTimeoutSegundos;
                     upCmd.Parameters.AddWithValue("@Id", idExistente.Value);
                     upCmd.Parameters.AddWithValue("@Etiqueta", string.IsNullOrWhiteSpace(req.Etiqueta) ? DBNull.Value : (object)req.Etiqueta.Trim());
                     upCmd.Parameters.AddWithValue("@Descripcion", string.IsNullOrWhiteSpace(req.Descripcion) ? DBNull.Value : (object)req.Descripcion.Trim());
                     upCmd.ExecuteNonQuery();
                 }
 
+                cache.Remove(CacheSeccionesLibros);
                 return Results.Ok(new { mensaje = "Novedad actualizada correctamente." });
             }
 
@@ -1338,6 +1367,7 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
 
         using (SqlCommand cmd = new SqlCommand(insertQuery, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Seccion", seccion);
             cmd.Parameters.AddWithValue("@IdLibro", idLibro);
             cmd.Parameters.AddWithValue("@PrecioOferta", seccion == "ofertas" && req.PrecioOferta.HasValue ? (object)req.PrecioOferta.Value : DBNull.Value);
@@ -1347,6 +1377,8 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
             cmd.ExecuteNonQuery();
         }
     }
+
+    cache.Remove(CacheSeccionesLibros);
 
     string mensaje = seccion == "ofertas"
         ? "Libro agregado a ofertas."
@@ -1361,7 +1393,7 @@ app.MapPost("/api/admin/secciones-libros", (AsignarLibroSeccionDto req) =>
     return Results.Ok(new { mensaje });
 });
 
-app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccionLibro) =>
+app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccionLibro, IMemoryCache cache) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
@@ -1369,6 +1401,7 @@ app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccion
         string deleteQuery = "delete from Seccion_Libros where id_seccion_libro = @Id";
         using (SqlCommand cmd = new SqlCommand(deleteQuery, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Id", idSeccionLibro);
             int filas = cmd.ExecuteNonQuery();
             if (filas == 0)
@@ -1378,54 +1411,46 @@ app.MapDelete("/api/admin/secciones-libros/{idSeccionLibro:int}", (int idSeccion
         }
     }
 
+    cache.Remove(CacheSeccionesLibros);
     return Results.Ok(new { mensaje = "Libro quitado de la sección." });
 });
 
-
-
-
-
-
-
-
-
-
-app.MapGet("/api/centros-recoleccion", () =>
+app.MapGet("/api/centros-recoleccion", async (IMemoryCache cache) =>
 {
-    var lista = new List<object>();
-
-    using (SqlConnection conn = new SqlConnection(connectionString))
+    var lista = await ObtenerEnCache(cache, CacheCentrosRecoleccion, async () =>
     {
-        conn.Open();
+        var items = new List<object>();
+        using var conn = new SqlConnection(connectionString);
+        await conn.OpenAsync();
         string query = @"
             select id_centro, estado, nombre, lat, lng, direccion, horario, instrucciones
-            from Centros_Recoleccion
+            from Centros_Recoleccion WITH (NOLOCK)
             order by estado, id_centro";
 
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
+        using var cmd = new SqlCommand(query, conn);
+        cmd.CommandTimeout = comandoTimeoutSegundos;
+        using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
         {
-            while (reader.Read())
+            items.Add(new
             {
-                lista.Add(new
-                {
-                    idCentro = reader.GetInt32(0),
-                    estado = reader.GetString(1),
-                    nombre = reader.GetString(2),
-                    lat = reader.GetDouble(3),
-                    lng = reader.GetDouble(4),
-                    direccion = reader.GetString(5),
-                    horario = reader.IsDBNull(6) ? "" : reader.GetString(6),
-                    instrucciones = reader.IsDBNull(7) ? "" : reader.GetString(7)
-                });
-            }
+                idCentro = reader.GetInt32(0),
+                estado = reader.GetString(1),
+                nombre = reader.GetString(2),
+                lat = reader.GetDouble(3),
+                lng = reader.GetDouble(4),
+                direccion = reader.GetString(5),
+                horario = reader.IsDBNull(6) ? "" : reader.GetString(6),
+                instrucciones = reader.IsDBNull(7) ? "" : reader.GetString(7)
+            });
         }
-    }
+        return items;
+    });
 
     return Results.Ok(lista);
 });
 
-app.MapPost("/api/admin/centros-recoleccion", (CentroRecoleccionDto req) =>
+app.MapPost("/api/admin/centros-recoleccion", (CentroRecoleccionDto req, IMemoryCache cache) =>
 {
     string estado = (req.Estado ?? "").Trim();
     string nombre = (req.Nombre ?? "").Trim();
@@ -1451,6 +1476,7 @@ app.MapPost("/api/admin/centros-recoleccion", (CentroRecoleccionDto req) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Estado", estado);
             cmd.Parameters.AddWithValue("@Nombre", nombre);
             cmd.Parameters.AddWithValue("@Lat", req.Lat.Value);
@@ -1462,10 +1488,11 @@ app.MapPost("/api/admin/centros-recoleccion", (CentroRecoleccionDto req) =>
         }
     }
 
+    cache.Remove(CacheCentrosRecoleccion);
     return Results.Ok(new { mensaje = "Centro de recolección agregado." });
 });
 
-app.MapDelete("/api/admin/centros-recoleccion/{id:int}", (int id) =>
+app.MapDelete("/api/admin/centros-recoleccion/{id:int}", (int id, IMemoryCache cache) =>
 {
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
@@ -1474,6 +1501,7 @@ app.MapDelete("/api/admin/centros-recoleccion/{id:int}", (int id) =>
 
         using (SqlCommand cmd = new SqlCommand(query, conn))
         {
+            cmd.CommandTimeout = comandoTimeoutSegundos;
             cmd.Parameters.AddWithValue("@Id", id);
             int filas = cmd.ExecuteNonQuery();
             if (filas == 0)
@@ -1483,10 +1511,9 @@ app.MapDelete("/api/admin/centros-recoleccion/{id:int}", (int id) =>
         }
     }
 
+    cache.Remove(CacheCentrosRecoleccion);
     return Results.Ok(new { mensaje = "Centro de recolección eliminado." });
 });
-
-
 
 // --- 2. INICIAR LA APLICACIÓN ---
 app.Run();
@@ -1503,15 +1530,10 @@ record PerfilUpdateDto(
 
 record NuevoLibroAdminDto(string Titulo, string Autor, decimal Precio, int Stock, string? Imagen, int IdCategoria);
 record EstadoPedidoDto(string Estado);
-
 record NuevaCategoriaDto(string Nombre);
-
 record EditarLibroDto(decimal Precio, int Stock);
-
 record RespuestaMensajeDto(string Respuesta);
-
 record GuardarBannerDto(string? ImagenUrl, string? EnlaceUrl, bool Activo);
-
 record GuardarBannerIntermedioDto(string? ImagenUrl, string? EnlaceUrl, bool Activo);
 
 record AsignarLibroSeccionDto(
